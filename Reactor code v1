@@ -1,0 +1,356 @@
+-- reactorV1.lua
+-- Controle reacteur fission Mekanism (StoneBlock 4) + Monitor + Speaker
+-- + Sécurités complètes + BurnRate piloté UNIQUEMENT par Coolant (min 10%)
+
+-- ====== CONFIG ======
+local AUTO_SIDE = "left"          -- levier "Marche Auto"
+local LOOP_SEC  = 0.5
+
+-- Burn rate piloté par coolant
+local COOLANT_FULL = 0.80         -- >= 80% -> burn max
+local COOLANT_LOW  = 0.10         -- <= 10% -> burn minimum
+local MIN_BURN     = 0.10         -- burn rate minimum (10% du max)
+local RAMP_STEP    = 0.2          -- variation max par boucle
+
+-- ===== Sécurités (seuils) =====
+local TEMP_TRIP    = 800          -- °C stop
+local TEMP_RESET   = 100          -- °C reset
+
+local COOLANT_TRIP  = 0.05        -- 5% stop (sécurité)
+local COOLANT_RESET = 0.80        -- 80% reset
+
+local HEATED_TRIP   = 0.80        -- 80% stop
+local HEATED_RESET  = 0.00        -- 0% reset
+
+local WASTE_TRIP    = 0.80        -- 80% stop
+local WASTE_RESET   = 0.50        -- 50% reset
+
+local DAMAGE_TRIP   = 30          -- >30% = arrêt absolu (lock)
+
+-- Affichage
+local TEXT_SCALE = 1.5
+
+-- Alarme
+local BEEP_SOUND = "minecraft:block.note_block.bell"
+local BEEP_VOL   = 1.5
+local BEEP_PITCH = 1.2
+local FORCED_ALARM_SECONDS = 3.0
+local FORCED_BEEP_PERIOD   = 0.35
+local LOCKED_BEEP_PERIOD   = 0.35
+
+-- ====== HELPERS ======
+local function safeCall(obj, method, ...)
+  if not obj or type(obj[method]) ~= "function" then return nil end
+  local ok, res = pcall(obj[method], obj, ...)
+  if not ok then return nil end
+  return res
+end
+
+local function clamp(x, a, b)
+  if x < a then return a end
+  if x > b then return b end
+  return x
+end
+
+local function clamp01(x) return clamp(x, 0, 1) end
+
+local function normalizePct(v)
+  if v == nil or type(v) ~= "number" then return nil end
+  if v > 1 then v = v / 100 end
+  return clamp01(v)
+end
+
+local function pctStr(x)
+  if x == nil then return "N/A" end
+  return string.format("%.1f%%", x * 100)
+end
+
+-- ====== PERIPHERALS ======
+local m = peripheral.find("monitor")
+if not m then
+  print("ERREUR: Moniteur non detecte.")
+  return
+end
+
+local r = peripheral.find("fissionReactorLogicAdapter")
+if not r then
+  print("ERREUR: Fission Reactor Logic Adapter non detecte.")
+  return
+end
+
+local speaker = peripheral.find("speaker")
+if not speaker then
+  print("ATTENTION: Speaker non detecte (alarme sonore inactive).")
+end
+
+m.setTextScale(TEXT_SCALE)
+m.setBackgroundColor(colors.black)
+m.clear()
+
+-- ====== READ REACTOR ======
+local function getTempC(r)
+  local tempK = safeCall(r, "getTemperature")
+  if tempK == nil or type(tempK) ~= "number" then return nil end
+  return tempK - 273.15
+end
+
+local function getCoolantPct(r)
+  return normalizePct(safeCall(r, "getCoolantFilledPercentage"))
+end
+
+local function getFuelPct(r)
+  return normalizePct(safeCall(r, "getFuelFilledPercentage"))
+end
+
+local function getHeatedPct(r)
+  return normalizePct(safeCall(r, "getHeatedCoolantFilledPercentage"))
+end
+
+local function getWastePct(r)
+  return normalizePct(safeCall(r, "getWasteFilledPercentage"))
+end
+
+local function getDamage(r)
+  local d = safeCall(r, "getDamagePercent")
+  if type(d) == "number" then return d end
+  return nil
+end
+
+-- Etat réel (fiable): burn > 0
+local function isReactorRunning(r)
+  local burn = safeCall(r, "getActualBurnRate")
+  if type(burn) ~= "number" then return false end
+  return burn > 0
+end
+
+-- ====== CONTROL REACTOR ======
+local function reactorOn(r)
+  safeCall(r, "activate")
+end
+
+local function reactorOff(r)
+  safeCall(r, "scram")
+end
+
+-- ====== BURN RATE ======
+local function getBurnRate(r)
+  local v = safeCall(r, "getActualBurnRate")
+  if type(v) == "number" then return v end
+  return 0
+end
+
+local function getMaxBurnRate(r)
+  local v = safeCall(r, "getMaxBurnRate")
+  if type(v) == "number" then return v end
+  return 0
+end
+
+local function setBurnRate(r, v)
+  safeCall(r, "setBurnRate", v)
+end
+
+local function computeTargetBurn(maxRate, coolantPct)
+  if maxRate <= 0 then return 0 end
+  if coolantPct == nil then
+    return maxRate * MIN_BURN
+  end
+
+  local c = clamp01(coolantPct)
+
+  if c <= COOLANT_LOW then
+    return maxRate * MIN_BURN
+  elseif c >= COOLANT_FULL then
+    return maxRate
+  else
+    local t = (c - COOLANT_LOW) / (COOLANT_FULL - COOLANT_LOW) -- 0..1
+    local factor = MIN_BURN + t * (1 - MIN_BURN)               -- MIN..1
+    return maxRate * factor
+  end
+end
+
+-- ====== UI ======
+local function drawLine(y, label, value, color)
+  m.setCursorPos(2, y)
+  m.setTextColor(colors.white)
+  m.write(label)
+  m.setCursorPos(24, y)
+  m.setTextColor(color or colors.white)
+  m.write(value)
+end
+
+-- ====== STATE ======
+local forcedStop = false
+local forcedReason = "Aucun"
+
+local lockedStop = false
+local lockedReason = "Aucun"
+
+local forcedAlarmUntil = 0
+local prevForcedStop = false
+
+local function render(autoEnabled, active, tempC, coolantPct, fuelPct, wastePct, heatedPct, damage, burn, maxBurn)
+  m.setBackgroundColor(colors.black)
+  m.clear()
+  m.setCursorPos(2,1)
+  m.setTextColor(colors.cyan)
+  m.write("=== CONTROLE REACTEUR FISSION ===")
+
+  drawLine(3, "Marche auto:", autoEnabled and "ACTIVE" or "DESACTIVE", autoEnabled and colors.lime or colors.red)
+
+  local stateTxt, stateCol
+  if lockedStop then
+    stateTxt, stateCol = "ARRET ABSOLU", colors.red
+  elseif forcedStop then
+    stateTxt, stateCol = "ARRET FORCE", colors.red
+  else
+    stateTxt, stateCol = (active and "ALLUME" or "ETEINT"), (active and colors.lime or colors.gray)
+  end
+  drawLine(4, "Etat reacteur:", stateTxt, stateCol)
+
+  if lockedStop then
+    drawLine(5, "Cause:", lockedReason, colors.red)
+  elseif forcedStop then
+    drawLine(5, "Cause:", forcedReason, colors.red)
+  else
+    drawLine(5, "Cause:", "-", colors.gray)
+  end
+
+  drawLine(7,  "Temperature:", tempC and string.format("%.1f C", tempC) or "N/A",
+    (tempC and tempC > TEMP_TRIP) and colors.red or colors.white)
+
+  drawLine(8,  "Coolant:", pctStr(coolantPct), (coolantPct and coolantPct < COOLANT_TRIP) and colors.red or colors.white)
+  drawLine(9,  "Fuel:",    pctStr(fuelPct), colors.white)
+  drawLine(10, "Waste:",   pctStr(wastePct), (wastePct and wastePct > WASTE_TRIP) and colors.red or colors.white)
+  drawLine(11, "Heated:",  pctStr(heatedPct), (heatedPct and heatedPct > HEATED_TRIP) and colors.red or colors.white)
+
+  local dmgText = damage and string.format("%.1f%%", damage) or "N/A"
+  drawLine(12, "Damage:", dmgText, (damage and damage > DAMAGE_TRIP) and colors.red or colors.white)
+
+  local burnTxt = (burn and maxBurn) and string.format("%.2f / %.2f", burn, maxBurn) or "N/A"
+  drawLine(13, "Burn rate:", burnTxt, colors.white)
+
+  m.setCursorPos(2,15)
+  m.setTextColor(colors.gray)
+  m.write("Coolant pilote burn (min 10%) | Defaut: bip 3s | Lock: bip continu")
+end
+
+-- ====== ALARM LOOP ======
+local function alarmLoop()
+  while true do
+    local now = os.clock()
+
+    if lockedStop then
+      if speaker then speaker.playSound(BEEP_SOUND, BEEP_VOL, BEEP_PITCH) end
+      sleep(LOCKED_BEEP_PERIOD)
+
+    elseif now < forcedAlarmUntil then
+      if speaker then speaker.playSound(BEEP_SOUND, BEEP_VOL, BEEP_PITCH) end
+      sleep(FORCED_BEEP_PERIOD)
+
+    else
+      sleep(0.1)
+    end
+  end
+end
+
+-- ====== MAIN LOOP ======
+local function mainLoop()
+  while true do
+    local autoEnabled = redstone.getInput(AUTO_SIDE)
+
+    local tempC      = getTempC(r)
+    local coolantPct = getCoolantPct(r)
+    local fuelPct    = getFuelPct(r)
+    local wastePct   = getWastePct(r)
+    local heatedPct  = getHeatedPct(r)
+    local damage     = getDamage(r)
+
+    -- ===== LOCKED SAFETY (damage) =====
+    if not lockedStop and damage ~= nil and damage > DAMAGE_TRIP then
+      lockedStop = true
+      lockedReason = "Dommages structurels critiques"
+      reactorOff(r)
+    end
+
+    -- ===== SAFETY TRIP (rearmable) =====
+    if not lockedStop and not forcedStop then
+      if tempC ~= nil and tempC > TEMP_TRIP then
+        forcedStop = true
+        forcedReason = "Temperature elevee"
+        reactorOff(r)
+
+      elseif coolantPct ~= nil and coolantPct < COOLANT_TRIP then
+        forcedStop = true
+        forcedReason = "Refroidissement insuffisant"
+        reactorOff(r)
+
+      elseif heatedPct ~= nil and heatedPct > HEATED_TRIP then
+        forcedStop = true
+        forcedReason = "Liquide chauffe trop eleve"
+        reactorOff(r)
+
+      elseif wastePct ~= nil and wastePct > WASTE_TRIP then
+        forcedStop = true
+        forcedReason = "Dechets nucleaires trop eleves"
+        reactorOff(r)
+      end
+    end
+
+    -- ===== SAFETY RESET CONDITIONS =====
+    if not lockedStop and forcedStop then
+      local tempOk    = (tempC == nil) or (tempC < TEMP_RESET)
+      local coolantOk = (coolantPct == nil) or (coolantPct > COOLANT_RESET)
+      local heatedOk  = (heatedPct == nil) or (heatedPct <= HEATED_RESET)
+      local wasteOk   = (wastePct == nil) or (wastePct < WASTE_RESET)
+
+      if tempOk and coolantOk and heatedOk and wasteOk then
+        forcedStop = false
+        forcedReason = "Aucun"
+      end
+    end
+
+    -- ===== ALARM TRIGGER =====
+    if forcedStop and not prevForcedStop then
+      forcedAlarmUntil = os.clock() + FORCED_ALARM_SECONDS
+    end
+    prevForcedStop = forcedStop
+
+    -- ===== AUTO CONTROL =====
+    if lockedStop then
+      reactorOff(r)
+    else
+      if not autoEnabled then
+        reactorOff(r)
+      else
+        if not forcedStop then
+          reactorOn(r)
+        else
+          reactorOff(r)
+        end
+      end
+    end
+
+    -- ===== BURN RATE REGULATION (coolant only, min 10%) =====
+    if autoEnabled and (not forcedStop) and (not lockedStop) then
+      local maxRate = getMaxBurnRate(r)
+      local curRate = getBurnRate(r)
+      local target  = computeTargetBurn(maxRate, coolantPct)
+
+      local diff = clamp(target - curRate, -RAMP_STEP, RAMP_STEP)
+      setBurnRate(r, curRate + diff)
+    else
+      -- si auto OFF ou en défaut: on met burn à 0 (tu peux le laisser à MIN si tu préfères)
+      setBurnRate(r, 0)
+    end
+
+    -- Etat réel relu APRÈS commandes
+    local active = isReactorRunning(r)
+    local burn   = getBurnRate(r)
+    local maxB   = getMaxBurnRate(r)
+
+    render(autoEnabled, active, tempC, coolantPct, fuelPct, wastePct, heatedPct, damage, burn, maxB)
+    sleep(LOOP_SEC)
+  end
+end
+
+parallel.waitForAny(mainLoop, alarmLoop)
