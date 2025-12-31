@@ -1,28 +1,31 @@
--- reactor_code_v0_6.lua
--- auto + safeties + stable monitor (no flicker) + bars
--- cc:tweaked + mekanism fission reactor logic adapter
+-- reactor_code_v0_6_1.lua
+-- text 1.8 + damage lock >30% + burn regulation using coolant + temperature
 
 -- ===== config =====
 local MONITOR_NAME = "monitor_7"
 local REACTOR_NAME = "fissionReactorLogicAdapter_0"
 
-local TEXT_SCALE   = 0.5
+local TEXT_SCALE   = 1.8
 local REFRESH_SEC  = 0.25
 
 -- auto switch (lever)
-local AUTO_SIDE    = "left"   -- change if needed: "right","back","front","top","bottom"
+local AUTO_SIDE    = "left"
 local AUTO_INVERT  = false
 
 -- burn control
 local MIN_BURN     = 0.10     -- 10%
-local COOLANT_FULL = 0.80     -- >= 80% => allow max
-local COOLANT_LOW  = 0.10     -- <= 10% => force minimum
-local RAMP_STEP    = 0.20     -- max burn delta per loop
+local COOLANT_FULL = 0.80
+local COOLANT_LOW  = 0.10
+local RAMP_STEP    = 0.10     -- smaller step = more stable
 
--- safety thresholds
-local T_STOP       = 800.0
-local T_RESET      = 700.0
+-- temperature regulation (main fix for overheating)
+local T_HARD_STOP  = 800.0    -- emergency scram
+local T_HARD_RESET = 700.0
 
+local T_SOFT_START = 550.0    -- start limiting burn
+local T_SOFT_FULL  = 700.0    -- at this temp => push burn toward MIN_BURN
+
+-- safety thresholds (other)
 local COOL_STOP    = 0.10
 local COOL_RESET   = 0.20
 
@@ -32,8 +35,9 @@ local HEAT_RESET   = 0.80
 local WASTE_STOP   = 0.90
 local WASTE_RESET  = 0.80
 
-local DMG_STOP     = 10.0
-local DMG_RESET    = 5.0
+-- damage lock (your request)
+local DMG_STOP     = 30.0
+local DMG_RESET    = 25.0
 
 -- bars
 local BAR_W = 26
@@ -115,6 +119,13 @@ local function bar(p)
   return "[" .. string.rep("#", fill) .. string.rep("-", BAR_W - fill) .. "]"
 end
 
+local function clamp(x, a, b)
+  if x == nil then return nil end
+  if x < a then return a end
+  if x > b then return b end
+  return x
+end
+
 local function colorByName(name)
   if name == "coolant" then return colors.lightBlue end
   if name == "fuel" then return colors.lime end
@@ -123,37 +134,10 @@ local function colorByName(name)
   return colors.white
 end
 
-local function clamp(x, a, b)
-  if x == nil then return nil end
-  if x < a then return a end
-  if x > b then return b end
-  return x
-end
-
 local function readAuto()
   local s = redstone.getInput(AUTO_SIDE)
   if AUTO_INVERT then s = not s end
   return s
-end
-
--- compute target burn from coolant percent
-local function targetBurnFromCoolant(coolPct, maxBurn)
-  if type(maxBurn) ~= "number" then return MIN_BURN end
-  if type(coolPct) ~= "number" then return MIN_BURN end
-
-  if coolPct <= COOLANT_LOW then
-    return MIN_BURN
-  end
-
-  if coolPct >= COOLANT_FULL then
-    return maxBurn
-  end
-
-  -- linear between LOW and FULL
-  local t = (coolPct - COOLANT_LOW) / (COOLANT_FULL - COOLANT_LOW)
-  t = clamp(t, 0, 1)
-  local b = MIN_BURN + t * (maxBurn - MIN_BURN)
-  return clamp(b, MIN_BURN, maxBurn)
 end
 
 local function ramp(current, target, step)
@@ -165,17 +149,48 @@ local function ramp(current, target, step)
   return target
 end
 
+-- target burn from coolant
+local function targetBurnFromCoolant(coolPct, maxBurn)
+  if type(maxBurn) ~= "number" then return MIN_BURN end
+  if type(coolPct) ~= "number" then return MIN_BURN end
+
+  if coolPct <= COOLANT_LOW then return MIN_BURN end
+  if coolPct >= COOLANT_FULL then return maxBurn end
+
+  local t = (coolPct - COOLANT_LOW) / (COOLANT_FULL - COOLANT_LOW)
+  t = clamp(t, 0, 1)
+  local b = MIN_BURN + t * (maxBurn - MIN_BURN)
+  return clamp(b, MIN_BURN, maxBurn)
+end
+
+-- temperature limiter (main anti-overheat)
+local function burnLimitFromTemp(temp, maxBurn)
+  if type(maxBurn) ~= "number" then return MIN_BURN end
+  if type(temp) ~= "number" then return maxBurn end
+
+  if temp <= T_SOFT_START then
+    return maxBurn
+  end
+  if temp >= T_SOFT_FULL then
+    return MIN_BURN
+  end
+
+  -- linear reduce between soft start and soft full
+  local t = (temp - T_SOFT_START) / (T_SOFT_FULL - T_SOFT_START) -- 0..1
+  t = clamp(t, 0, 1)
+  local lim = maxBurn - t * (maxBurn - MIN_BURN)
+  return clamp(lim, MIN_BURN, maxBurn)
+end
+
 -- ===== state =====
 local locked = false
 local locked_reason = "-"
-local last_cause = "-"
 local last_burn_set = nil
 
 -- ===== main loop =====
 while true do
   W, H = mon.getSize()
 
-  -- read data
   local auto_on = readAuto()
 
   local okForce, forceDisabled = safeCall(function() return reactor.isForceDisabled() end)
@@ -224,7 +239,9 @@ while true do
 
   if forceDisabled then
     trip_reason = "forced"
-  elseif okTemp and type(temp)=="number" and temp >= T_STOP then
+  elseif okDmg and type(dmg)=="number" and dmg >= DMG_STOP then
+    trip_reason = "damage lock"
+  elseif okTemp and type(temp)=="number" and temp >= T_HARD_STOP then
     trip_reason = "temp high"
   elseif okCFP and type(coolPct)=="number" and coolPct <= COOL_STOP then
     trip_reason = "coolant low"
@@ -232,21 +249,17 @@ while true do
     trip_reason = "heated high"
   elseif okWFP and type(wastePct)=="number" and wastePct >= WASTE_STOP then
     trip_reason = "waste high"
-  elseif okDmg and type(dmg)=="number" and dmg >= DMG_STOP then
-    trip_reason = "damage high"
   end
 
-  -- if trip => scram + lock
   if trip_reason ~= nil then
     locked = true
     locked_reason = trip_reason
-    last_cause = trip_reason
     safeCall(function() reactor.scram() end)
   end
 
-  -- unlock conditions (only if not forceDisabled)
+  -- unlock
   if locked and (not forceDisabled) then
-    local temp_ok  = (not okTemp) or (type(temp)~="number") or (temp <= T_RESET)
+    local temp_ok  = (not okTemp) or (type(temp)~="number") or (temp <= T_HARD_RESET)
     local cool_ok  = (not okCFP) or (type(coolPct)~="number") or (coolPct >= COOL_RESET)
     local heat_ok  = (not okHFP) or (type(heatPct)~="number") or (heatPct <= HEAT_RESET)
     local waste_ok = (not okWFP) or (type(wastePct)~="number") or (wastePct <= WASTE_RESET)
@@ -260,37 +273,38 @@ while true do
 
   -- ===== auto control =====
   if auto_on and (not locked) and (not forceDisabled) then
-    -- ensure reactor on
     if okStatus and (not isOn) then
       safeCall(function() reactor.activate() end)
     end
 
-    -- set burn rate based on coolant
     if okMBR and type(maxBurn)=="number" then
-      local target = targetBurnFromCoolant(coolPct, maxBurn)
+      local t1 = targetBurnFromCoolant(coolPct, maxBurn)
+      local t2 = burnLimitFromTemp(temp, maxBurn)
+      local target = math.min(t1, t2) -- key change: coolant + temp
+
       local cur = (okBR and type(burn)=="number") and burn or last_burn_set
       local nextBurn = ramp(cur, target, RAMP_STEP)
 
-      -- set only if changed enough
       if (last_burn_set == nil) or (type(nextBurn)=="number" and math.abs(nextBurn - last_burn_set) >= 0.01) then
         safeCall(function() reactor.setBurnRate(nextBurn) end)
         last_burn_set = nextBurn
       end
     end
   else
-    -- if auto off, do not spam burn changes
     last_burn_set = nil
   end
 
   -- ===== draw ui =====
   drawLine(1, "control fission reactor", colors.cyan, "", colors.white)
-  drawLine(2, REACTOR_NAME, colors.gray, locked and ("lock: " .. locked_reason) or (forceDisabled and "forced") or "ok",
-    (locked or forceDisabled) and colors.red or colors.lime)
+  drawLine(2, REACTOR_NAME, colors.gray,
+    locked and ("lock: " .. locked_reason) or (forceDisabled and "forced") or "ok",
+    (locked or forceDisabled) and colors.red or colors.lime
+  )
 
   local autoTxt = auto_on and "auto:on" or "auto:off"
   local autoCol = auto_on and colors.lime or colors.red
-
   local stateCol = (stateTxt == "on") and colors.lime or (stateTxt == "off" and colors.red or colors.lightGray)
+
   local tempTxt = okTemp and (fmtNum(temp, 1) .. " c") or "n/a"
   drawLine(4, autoTxt, autoCol, "state: " .. stateTxt, stateCol)
   drawLine(5, "cause: " .. (locked and locked_reason or "-"), colors.yellow, "temp: " .. tempTxt, colors.yellow)
@@ -314,7 +328,6 @@ while true do
   local burnTxt = (okBR and okMBR) and (fmtNum(burn,2) .. " / " .. fmtNum(maxBurn,2)) or "n/a"
   drawLine(y1 + 5, "damage: " .. dmgTxt, colors.red, "burn: " .. burnTxt, colors.green)
 
-  -- footer
   drawLine(H, "min burn 10% | auto lever " .. AUTO_SIDE, colors.gray, "", colors.white)
 
   sleep(REFRESH_SEC)
