@@ -1,1 +1,127 @@
 
+-- test_reactor.lua
+-- scans all methods of a peripheral and prints results on a monitor
+-- no accents
+
+local MONITOR_NAME = "monitor_7"
+local REACTOR_NAME = "fissionReactorLogicAdapter_0"
+
+local function safeCall(obj, methodName, ...)
+  if not obj or type(obj[methodName]) ~= "function" then
+    return false, "missing method"
+  end
+  local ok, res1, res2, res3, res4 = pcall(obj[methodName], ...)
+  if not ok then return false, res1 end
+  return true, res1, res2, res3, res4
+end
+
+local function toStr(x)
+  if x == nil then return "nil" end
+  if type(x) == "string" then return x end
+  if type(x) == "number" then return tostring(x) end
+  if type(x) == "boolean" then return x and "true" or "false" end
+  return "(" .. type(x) .. ")"
+end
+
+local function summarizeTable(t)
+  local keys = {}
+  local n = 0
+  for k, _ in pairs(t) do
+    n = n + 1
+    if n <= 8 then keys[#keys+1] = tostring(k) end
+  end
+  table.sort(keys)
+  local ks = table.concat(keys, ",")
+  if n > 8 then ks = ks .. ",..." end
+  return "table keys=" .. tostring(n) .. " [" .. ks .. "]"
+end
+
+local function shortSerialize(t)
+  local ok, text = pcall(function()
+    return textutils.serialize(t, { compact = true })
+  end)
+  if not ok or not text then return "(cannot serialize)" end
+  if #text > 140 then
+    return string.sub(text, 1, 140) .. "..."
+  end
+  return text
+end
+
+local function getMethods(name)
+  local ok, list = pcall(peripheral.getMethods, name)
+  if not ok then return nil, "getMethods failed: " .. tostring(list) end
+  if type(list) ~= "table" then return nil, "getMethods returned " .. type(list) end
+  table.sort(list)
+  return list
+end
+
+-- setup monitor
+local mon = peripheral.wrap(MONITOR_NAME)
+if not mon then
+  error("monitor not found: " .. MONITOR_NAME)
+end
+mon.setTextScale(0.5)
+mon.setBackgroundColor(colors.black)
+mon.setTextColor(colors.white)
+mon.clear()
+
+-- setup reactor
+local r = peripheral.wrap(REACTOR_NAME)
+if not r then
+  error("reactor not found: " .. REACTOR_NAME)
+end
+
+local methods, err = getMethods(REACTOR_NAME)
+if not methods then
+  error(err)
+end
+
+-- screen helpers
+local w, h = mon.getSize()
+local line = 1
+local function writeLine(txt, col)
+  if line > h then
+    -- wait for key then clear for next page
+    mon.setCursorPos(1, h)
+    mon.setTextColor(colors.gray)
+    mon.write("press any key...")
+    os.pullEvent("key")
+    mon.clear()
+    line = 1
+  end
+  mon.setCursorPos(1, line)
+  if col then mon.setTextColor(col) else mon.setTextColor(colors.white) end
+  mon.write(string.sub(txt .. string.rep(" ", w), 1, w))
+  line = line + 1
+end
+
+writeLine("reactor method tester", colors.cyan)
+writeLine("monitor: " .. MONITOR_NAME, colors.lightGray)
+writeLine("reactor : " .. REACTOR_NAME, colors.lightGray)
+writeLine("methods : " .. tostring(#methods), colors.lightGray)
+writeLine(string.rep("-", w), colors.gray)
+
+for _, m in ipairs(methods) do
+  -- try call with no args
+  local ok, a, b, c, d = safeCall(r, m)
+
+  if not ok then
+    writeLine("x " .. m .. " -> " .. tostring(a), colors.red)
+  else
+    -- show first return
+    local t = type(a)
+    if t == "table" then
+      writeLine("ok " .. m .. " -> " .. summarizeTable(a), colors.lime)
+      writeLine("   " .. shortSerialize(a), colors.lightGray)
+    else
+      local out = toStr(a)
+      if b ~= nil then out = out .. " | " .. toStr(b) end
+      if c ~= nil then out = out .. " | " .. toStr(c) end
+      if d ~= nil then out = out .. " | " .. toStr(d) end
+      writeLine("ok " .. m .. " -> (" .. t .. ") " .. out, colors.lime)
+    end
+  end
+end
+
+writeLine(string.rep("-", w), colors.gray)
+writeLine("done", colors.cyan)
