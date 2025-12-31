@@ -1,0 +1,293 @@
+-- reactor_code_v0_5.lua
+
+local MONITOR_NAME = "monitor_7"
+local REACTOR_NAME = "fissionReactorLogicAdapter_0"
+
+local LOOP_SEC = 0.5
+
+-- auto burn control by coolant
+local AUTO = true
+local MIN_BURN = 0.10 -- 10%
+local COOLANT_LOW = 0.10
+local COOLANT_FULL = 0.80
+local MAX_STEP = 5 -- max change per loop (burn rate units)
+
+-- ---------------- utils ----------------
+
+local function clamp(x, a, b)
+  if x < a then return a end
+  if x > b then return b end
+  return x
+end
+
+local function safeCall(obj, name, ...)
+  local f = obj and obj[name]
+  if type(f) ~= "function" then return false, "missing method" end
+  local ok, a, b, c, d = pcall(f, ...)
+  if not ok then return false, a end
+  return true, a, b, c, d
+end
+
+local function pctStr01(x)
+  if type(x) ~= "number" then return "n/a" end
+  return string.format("%.1f%%", x * 100)
+end
+
+local function tempC(k)
+  if type(k) ~= "number" then return nil end
+  return k - 273.15
+end
+
+local function padRight(s, w)
+  s = tostring(s or "")
+  if #s < w then
+    return s .. string.rep(" ", w - #s)
+  end
+  return string.sub(s, 1, w)
+end
+
+local function bar01(p, w)
+  if type(p) ~= "number" then
+    return "[" .. string.rep("-", w) .. "]"
+  end
+  p = clamp(p, 0, 1)
+  local fill = math.floor(p * w + 0.5)
+  if fill > w then fill = w end
+  return "[" .. string.rep("#", fill) .. string.rep("-", w - fill) .. "]"
+end
+
+local function tblNameAmount(t)
+  if type(t) ~= "table" then return nil, nil end
+  return t.name, t.amount
+end
+
+local function fmtMb(x)
+  if type(x) ~= "number" then return "n/a" end
+  return string.format("%.0f mb", x)
+end
+
+local function fmtMbPair(a, cap)
+  if type(a) ~= "number" or type(cap) ~= "number" then return "n/a" end
+  return string.format("%.0f/%.0f mb", a, cap)
+end
+
+-- ---------------- peripherals ----------------
+
+local mon = peripheral.wrap(MONITOR_NAME)
+if not mon then error("monitor not found: " .. MONITOR_NAME) end
+
+local reactor = peripheral.wrap(REACTOR_NAME)
+if not reactor then error("reactor not found: " .. REACTOR_NAME) end
+
+-- optional: set modes once
+safeCall(reactor, "setLogicMode", "ACTIVATION")
+safeCall(reactor, "setRedstoneMode", "HIGH")
+
+mon.setBackgroundColor(colors.black)
+mon.setTextColor(colors.white)
+mon.setTextScale(0.5)
+
+local mw, mh = mon.getSize()
+
+-- draw static layout once (no flicker)
+mon.clear()
+
+local function writeAt(x, y, txt, col)
+  if col then mon.setTextColor(col) else mon.setTextColor(colors.white) end
+  mon.setCursorPos(x, y)
+  mon.write(padRight(txt, mw - x + 1))
+end
+
+-- header
+writeAt(1, 1, "control fission reactor", colors.cyan)
+writeAt(1, 2, REACTOR_NAME, colors.lightGray)
+
+-- labels (left)
+writeAt(1, 3, "state:", colors.white)
+writeAt(1, 4, "temp:", colors.white)
+writeAt(1, 5, "heat:", colors.white)
+writeAt(1, 6, "cool:", colors.white)
+
+writeAt(1, 8, "coolant", colors.lightBlue)
+writeAt(1, 9, "fuel", colors.lime)
+writeAt(1, 10, "waste", colors.magenta)
+writeAt(1, 11, "heated", colors.orange)
+
+writeAt(1, 13, "coolant:", colors.lightBlue)
+writeAt(1, 14, "fuel:", colors.lime)
+writeAt(1, 15, "waste:", colors.magenta)
+writeAt(1, 16, "heated:", colors.orange)
+
+writeAt(1, 18, "damage:", colors.white)
+writeAt(1, 19, "burn:", colors.white)
+
+-- positions
+local XVAL = 8
+local XBAR = 9
+local BARW = math.max(10, mw - XBAR - 1)
+
+local lastBurn = nil
+
+while true do
+  local err = ""
+
+  -- core
+  local okStatus, status = safeCall(reactor, "getStatus")
+  local okTemp, tK = safeCall(reactor, "getTemperature")
+  local okHeat, heatRate = safeCall(reactor, "getHeatingRate")
+
+  -- percent
+  local okCoolP, coolP = safeCall(reactor, "getCoolantFilledPercentage")
+  local okFuelP, fuelP = safeCall(reactor, "getFuelFilledPercentage")
+  local okWasteP, wasteP = safeCall(reactor, "getWasteFilledPercentage")
+  local okHeatP, heatP = safeCall(reactor, "getHeatedCoolantFilledPercentage")
+
+  -- tables + capacities
+  local okCoolT, coolT = safeCall(reactor, "getCoolant")
+  local okFuelT, fuelT = safeCall(reactor, "getFuel")
+  local okWasteT, wasteT = safeCall(reactor, "getWaste")
+  local okHeatedT, heatedT = safeCall(reactor, "getHeatedCoolant")
+
+  local okCoolCap, coolCap = safeCall(reactor, "getCoolantCapacity")
+  local okFuelCap, fuelCap = safeCall(reactor, "getFuelCapacity")
+  local okWasteCap, wasteCap = safeCall(reactor, "getWasteCapacity")
+  local okHeatedCap, heatedCap = safeCall(reactor, "getHeatedCoolantCapacity")
+
+  -- others
+  local okDmg, dmg = safeCall(reactor, "getDamagePercent")
+  local okBurn, burn = safeCall(reactor, "getBurnRate")
+  local okMaxBurn, maxBurn = safeCall(reactor, "getMaxBurnRate")
+
+  if not okStatus then err = "status " .. tostring(status) end
+  if not okTemp then err = (err ~= "" and (err .. " | ") or "") .. "temp " .. tostring(tK) end
+
+  -- state
+  if okStatus and type(status) == "boolean" then
+    writeAt(XVAL, 3, status and "on" or "off", status and colors.lime or colors.red)
+  else
+    writeAt(XVAL, 3, "n/a", colors.gray)
+  end
+
+  -- temp (kelvin -> c)
+  if okTemp and type(tK) == "number" then
+    writeAt(XVAL, 4, string.format("%.1f c", tempC(tK)), colors.orange)
+  else
+    writeAt(XVAL, 4, "n/a", colors.gray)
+  end
+
+  -- heating rate
+  if okHeat and type(heatRate) == "number" then
+    writeAt(XVAL, 5, string.format("%.2f u/t", heatRate), colors.yellow)
+  else
+    writeAt(XVAL, 5, "n/a", colors.gray)
+  end
+
+  -- coolant type (name)
+  local coolName = nil
+  if okCoolT then
+    coolName = select(1, tblNameAmount(coolT))
+  end
+  if type(coolName) == "string" and coolName ~= "" then
+    writeAt(XVAL, 6, coolName, colors.lightBlue)
+  else
+    writeAt(XVAL, 6, "n/a", colors.gray)
+  end
+
+  -- bars + percent
+  writeAt(XBAR, 8, bar01(coolP, BARW), colors.lightBlue)
+  writeAt(XVAL, 8, pctStr01(coolP), colors.lightBlue)
+
+  writeAt(XBAR, 9, bar01(fuelP, BARW), colors.lime)
+  writeAt(XVAL, 9, pctStr01(fuelP), colors.lime)
+
+  writeAt(XBAR, 10, bar01(wasteP, BARW), colors.magenta)
+  writeAt(XVAL, 10, pctStr01(wasteP), colors.magenta)
+
+  writeAt(XBAR, 11, bar01(heatP, BARW), colors.orange)
+  writeAt(XVAL, 11, pctStr01(heatP), colors.orange)
+
+  -- numeric amounts with units (mb)
+  local _, coolAmt = tblNameAmount(coolT)
+  local _, fuelAmt = tblNameAmount(fuelT)
+  local _, wasteAmt = tblNameAmount(wasteT)
+  local _, heatedAmt = tblNameAmount(heatedT)
+
+  if type(coolAmt) == "number" and type(coolCap) == "number" then
+    writeAt(XVAL, 13, fmtMbPair(coolAmt, coolCap), colors.lightBlue)
+  else
+    writeAt(XVAL, 13, "n/a", colors.gray)
+  end
+
+  if type(fuelAmt) == "number" and type(fuelCap) == "number" then
+    writeAt(XVAL, 14, fmtMbPair(fuelAmt, fuelCap), colors.lime)
+  else
+    writeAt(XVAL, 14, "n/a", colors.gray)
+  end
+
+  if type(wasteAmt) == "number" and type(wasteCap) == "number" then
+    writeAt(XVAL, 15, fmtMbPair(wasteAmt, wasteCap), colors.magenta)
+  else
+    writeAt(XVAL, 15, "n/a", colors.gray)
+  end
+
+  if type(heatedAmt) == "number" and type(heatedCap) == "number" then
+    writeAt(XVAL, 16, fmtMbPair(heatedAmt, heatedCap), colors.orange)
+  else
+    writeAt(XVAL, 16, "n/a", colors.gray)
+  end
+
+  -- damage
+  if okDmg and type(dmg) == "number" then
+    writeAt(XVAL, 18, string.format("%.1f%%", dmg), dmg > 0 and colors.red or colors.white)
+  else
+    writeAt(XVAL, 18, "n/a", colors.gray)
+  end
+
+  -- burn
+  if okBurn and type(burn) == "number" and okMaxBurn and type(maxBurn) == "number" then
+    writeAt(XVAL, 19, string.format("%.2f / %.2f", burn, maxBurn), colors.white)
+  else
+    writeAt(XVAL, 19, "n/a", colors.gray)
+  end
+
+  -- auto burn (coolant only)
+  if AUTO and okCoolP and type(coolP) == "number" and okBurn and type(burn) == "number" then
+    local target
+    if coolP <= COOLANT_LOW then
+      target = 0
+    elseif coolP >= COOLANT_FULL then
+      target = (type(maxBurn) == "number") and maxBurn or burn
+    else
+      local k = (coolP - COOLANT_LOW) / (COOLANT_FULL - COOLANT_LOW)
+      local m = (type(maxBurn) == "number") and maxBurn or burn
+      target = MIN_BURN * m + k * (m - MIN_BURN * m)
+    end
+
+    if target > 0 and type(maxBurn) == "number" then
+      target = clamp(target, MIN_BURN * maxBurn, maxBurn)
+    end
+
+    if lastBurn == nil then lastBurn = burn end
+    local step = clamp(target - burn, -MAX_STEP, MAX_STEP)
+    local newBurn = burn + step
+
+    if math.abs(newBurn - burn) >= 0.01 then
+      local okSet, e = safeCall(reactor, "setBurnRate", newBurn)
+      if not okSet then
+        err = (err ~= "" and (err .. " | ") or "") .. "setBurnRate " .. tostring(e)
+      end
+    end
+    lastBurn = newBurn
+  end
+
+  -- error line (top right)
+  if err == "" then
+    writeAt(mw - 15, 2, "err: none", colors.gray)
+  else
+    local short = err
+    if #short > 40 then short = string.sub(short, 1, 40) .. "..." end
+    writeAt(mw - 15, 2, "err: " .. short, colors.red)
+  end
+
+  sleep(LOOP_SEC)
+end
