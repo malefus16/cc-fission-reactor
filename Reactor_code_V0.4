@@ -1,495 +1,218 @@
 -- reactor_code_v0_4.lua
--- cc:tweaked + mekanism fission reactor logic adapter
--- fixed: correct method names (case sensitive), stable screen (no flicker), bars back, auto safeties + alarms
 
--- =========================
--- config (edit if needed)
--- =========================
+local MONITOR_NAME = "monitor_7"
 local REACTOR_NAME = "fissionReactorLogicAdapter_0"
-local MONITOR_NAME = "monitor_7"      -- your 7x6 monitor is monitor_7
-local AUTO_SIDE    = "left"           -- lever for auto mode
 
-local LOOP_SEC     = 0.25
+local LOOP_SEC = 0.5
 
--- burn control by coolant (keep min 10%)
-local COOLANT_FULL = 0.80            -- 80% -> allow burn max
-local COOLANT_LOW  = 0.10            -- 10% -> burn minimum
-local MIN_BURN_FRAC = 0.10           -- 10% of max burn
-local RAMP_STEP_FRAC = 0.20          -- max change per loop (20% of max burn)
+-- auto burn control by coolant
+local AUTO = true
+local MIN_BURN = 0.10 -- 10%
+local COOLANT_LOW = 0.10
+local COOLANT_FULL = 0.80
+local MAX_STEP = 5 -- max change per loop (burn rate units)
 
--- safeties (percent are 0..1)
-local COOL_STOP   = 0.05
-local COOL_RESET  = 0.80
+-- ---------------- utils ----------------
 
-local TEMP_STOP_C  = 800
-local TEMP_RESET_C = 100
-
-local HEAT_STOP   = 0.80
-local HEAT_RESET  = 0.00
-
-local WASTE_STOP  = 0.80
-local WASTE_RESET = 0.50
-
-local DAMAGE_LOCK_PCT = 30           -- absolute lock if damage percent > 30
-
--- alarm
-local ALARM_FORCE_SEC = 3
-
--- =========================
--- helpers
--- =========================
 local function clamp(x, a, b)
-  if x == nil then return nil end
   if x < a then return a end
   if x > b then return b end
   return x
 end
 
-local function safe_call(obj, method, ...)
-  if not obj or not method then return nil end
-  local fn = obj[method]
-  if type(fn) ~= "function" then return nil end
-  local ok, res = pcall(fn, obj, ...)
-  if not ok then return nil end
-  return res
+local function safeCall(obj, name, ...)
+  local f = obj and obj[name]
+  if type(f) ~= "function" then return false, "missing method" end
+  local ok, a, b, c, d = pcall(f, ...)
+  if not ok then return false, a end
+  return true, a, b, c, d
 end
 
-local function pct_from_filled_capacity(obj, filled_m, cap_m)
-  local filled = safe_call(obj, filled_m)
-  local cap    = safe_call(obj, cap_m)
-  if type(filled) == "number" and type(cap) == "number" and cap > 0 then
-    return clamp(filled / cap, 0, 1), filled, cap
-  end
-  return nil, filled, cap
+local function pctStr01(x)
+  if type(x) ~= "number" then return "n/a" end
+  return string.format("%.1f%%", x * 100)
 end
 
-local function get_pct(obj, filled_m, cap_m, pct_m)
-  -- prefer filled/capacity (works on your mekanism)
-  local p, filled, cap = pct_from_filled_capacity(obj, filled_m, cap_m)
-  if p ~= nil then return p, filled, cap end
-
-  -- fallback if some packs expose *_FilledPercentage
-  local pp = safe_call(obj, pct_m)
-  if type(pp) == "number" then
-    -- some return 0..1, some 0..100
-    if pp > 1.0 then pp = pp / 100 end
-    return clamp(pp, 0, 1), nil, nil
-  end
-
-  return nil, filled, cap
-end
-
-local function fmt_pct(p)
-  if type(p) ~= "number" then return "n/a" end
-  return string.format("%.1f%%", p * 100)
-end
-
-local function k_to_c(k)
+local function tempC(k)
   if type(k) ~= "number" then return nil end
   return k - 273.15
 end
 
-local function bar(p, w)
+local function padRight(s, w)
+  s = tostring(s or "")
+  if #s < w then
+    return s .. string.rep(" ", w - #s)
+  end
+  return string.sub(s, 1, w)
+end
+
+local function bar01(p, w)
   if type(p) ~= "number" then
-    return string.rep("-", w)
+    return "[" .. string.rep("-", w) .. "]"
   end
   p = clamp(p, 0, 1)
   local fill = math.floor(p * w + 0.5)
-  if fill < 0 then fill = 0 end
   if fill > w then fill = w end
-  return string.rep("#", fill) .. string.rep("-", w - fill)
+  return "[" .. string.rep("#", fill) .. string.rep("-", w - fill) .. "]"
 end
 
--- =========================
--- peripherals
--- =========================
-local reactor = peripheral.wrap(REACTOR_NAME)
-if not reactor then error("no reactor found: " .. REACTOR_NAME) end
+-- ---------------- peripherals ----------------
 
 local mon = peripheral.wrap(MONITOR_NAME)
-if not mon then
-  mon = peripheral.find("monitor")
-end
-if not mon then error("no monitor found") end
+if not mon then error("monitor not found: " .. MONITOR_NAME) end
 
--- pick first speaker if any
-local speaker = peripheral.find("speaker")
+local reactor = peripheral.wrap(REACTOR_NAME)
+if not reactor then error("reactor not found: " .. REACTOR_NAME) end
 
--- stable drawing: redirect to monitor, but do not clear each loop
-term.redirect(mon)
-mon.setTextScale(0.5) -- fits more text; change to 1.0 if you want bigger
+-- optional: set modes once (no crash if not supported)
+safeCall(reactor, "setLogicMode", "ACTIVATION")
+safeCall(reactor, "setRedstoneMode", "HIGH")
 
-local W, H = mon.getSize()
+mon.setBackgroundColor(colors.black)
+mon.setTextColor(colors.white)
+mon.setTextScale(0.5)
 
--- colors helper
-local function cwrite(x, y, col, txt)
-  term.setCursorPos(x, y)
-  term.setTextColor(col)
-  term.write(txt)
-end
+local mw, mh = mon.getSize()
 
-local function clear_line(y)
-  term.setCursorPos(1, y)
-  term.setTextColor(colors.white)
-  term.write(string.rep(" ", W))
+-- build a fixed layout once (no flicker)
+mon.clear()
+
+local function writeAt(x, y, txt, col)
+  if col then mon.setTextColor(col) else mon.setTextColor(colors.white) end
+  mon.setCursorPos(x, y)
+  mon.write(padRight(txt, mw - x + 1))
 end
 
--- =========================
--- alarms
--- =========================
-local alarm_force_until = 0
-local alarm_locked = false
+-- header
+writeAt(1, 1, "control fission reactor", colors.cyan)
+writeAt(1, 2, REACTOR_NAME, colors.lightGray)
 
-local function speaker_beep_once()
-  if not speaker then return end
-  -- safe sound
-  pcall(speaker.playSound, "minecraft:block.note_block.pling", 2.0, 1.0)
-end
+-- static labels
+writeAt(1, 3, "state:", colors.white)
+writeAt(1, 4, "temp:", colors.white)
 
-local function update_alarm(now)
-  if alarm_locked then
-    -- continuous beep
-    speaker_beep_once()
-    return
-  end
-  if now < alarm_force_until then
-    speaker_beep_once()
-  end
-end
+writeAt(1, 6, "coolant", colors.lightBlue)
+writeAt(1, 7, "fuel", colors.lime)
+writeAt(1, 8, "waste", colors.magenta)
+writeAt(1, 9, "heated", colors.orange)
 
--- =========================
--- state machine
--- =========================
-local locked_trip = false
-local trip_cause = "-"
-local forced_trip = false
+writeAt(1, 11, "damage:", colors.white)
+writeAt(1, 12, "burn:", colors.white)
 
-local function set_trip(cause, is_locked)
-  trip_cause = cause or "-"
-  if is_locked then
-    locked_trip = true
-    forced_trip = true
-    alarm_locked = true
-  else
-    forced_trip = true
-    alarm_force_until = os.clock() + ALARM_FORCE_SEC
-  end
-end
+-- right side values positions
+local XVAL = 8
+local XBAR = 9
+local BARW = math.max(10, mw - XBAR - 1) -- big bar
 
-local function clear_trip()
-  forced_trip = false
-  trip_cause = "-"
-end
+-- ---------------- loop ----------------
 
--- =========================
--- ui template
--- =========================
-local function draw_template()
-  mon.setBackgroundColor(colors.black)
-  mon.clear()
-  term.setTextColor(colors.lightBlue)
-  term.setCursorPos(1, 1)
-  term.write("control fission reactor")
-
-  term.setTextColor(colors.gray)
-  term.setCursorPos(1, 2)
-  term.write(REACTOR_NAME)
-
-  -- left status block
-  term.setTextColor(colors.white)
-  cwrite(1, 4, colors.white, "auto:")
-  cwrite(1, 5, colors.white, "state:")
-  cwrite(1, 6, colors.white, "cause:")
-
-  -- center temp
-  cwrite(math.floor(W/2) - 6, 6, colors.white, "temp:")
-
-  -- bars labels
-  local y0 = 8
-  cwrite(1, y0 + 0, colors.white, "coolant")
-  cwrite(1, y0 + 1, colors.white, "fuel")
-  cwrite(1, y0 + 2, colors.white, "waste")
-  cwrite(1, y0 + 3, colors.white, "heated")
-
-  -- values labels
-  local yv = y0 + 5
-  cwrite(1, yv + 0, colors.lightBlue, "coolant")
-  cwrite(1, yv + 1, colors.lime,      "fuel")
-  cwrite(1, yv + 2, colors.purple,    "waste")
-  cwrite(1, yv + 3, colors.orange,    "heated")
-  cwrite(1, yv + 4, colors.white,     "damage")
-
-  cwrite(1, yv + 6, colors.white, "burn:")
-
-  -- footer
-  if H >= (yv + 8) then
-    cwrite(1, yv + 8, colors.gray, "min burn 10% | forced alarm 3s | locked alarm cont")
-  end
-end
-
-draw_template()
-
--- =========================
--- main loop
--- =========================
-local last_auto = nil
-local last_state = nil
-local last_cause = nil
-local last_temp = nil
-local last_vals = {}
+local lastBurn = nil
+local lastErr = ""
 
 while true do
-  local now = os.clock()
+  local err = ""
 
-  -- auto lever
-  local auto = redstone.getInput(AUTO_SIDE) == true
+  -- read values
+  local okStatus, status = safeCall(reactor, "getStatus")
+  local okTemp, tK = safeCall(reactor, "getTemperature")
 
-  -- read reactor data (correct mekanism methods)
-  local status = safe_call(reactor, "getStatus") -- string or enum-like
-  local active = false
-  if type(status) == "string" then
-    -- common outputs: "running", "idle", "offline", etc
-    local s = string.lower(status)
-    active = (s == "running") or (s == "active") or (s == "online")
+  local okCoolP, coolP = safeCall(reactor, "getCoolantFilledPercentage")
+  local okFuelP, fuelP = safeCall(reactor, "getFuelFilledPercentage")
+  local okWasteP, wasteP = safeCall(reactor, "getWasteFilledPercentage")
+  local okHeatP, heatP = safeCall(reactor, "getHeatedCoolantFilledPercentage")
+
+  local okDmg, dmg = safeCall(reactor, "getDamagePercent")
+  local okBurn, burn = safeCall(reactor, "getBurnRate")
+  local okMaxBurn, maxBurn = safeCall(reactor, "getMaxBurnRate")
+
+  if not okStatus then err = "status " .. tostring(status) end
+  if not okTemp then err = (err ~= "" and (err .. " | ") or "") .. "temp " .. tostring(tK) end
+
+  -- display state
+  if okStatus and type(status) == "boolean" then
+    writeAt(XVAL, 3, status and "on" or "off", status and colors.lime or colors.red)
   else
-    -- fallback: some packs expose getRedstoneLogicStatus() bool
-    local rs = safe_call(reactor, "getRedstoneLogicStatus")
-    if type(rs) == "boolean" then active = rs end
+    writeAt(XVAL, 3, "n/a", colors.gray)
   end
 
-  local temp_k = safe_call(reactor, "getTemperature")
-  local temp_c = k_to_c(temp_k)
-
-  local coolant_pct = get_pct(reactor, "getCoolantFilled", "getCoolantCapacity", "getCoolantFilledPercentage")
-  local fuel_pct    = get_pct(reactor, "getFuelFilled", "getFuelCapacity", "getFuelFilledPercentage")
-  local waste_pct   = get_pct(reactor, "getWasteFilled", "getWasteCapacity", "getWasteFilledPercentage")
-  local heated_pct  = get_pct(reactor, "getHeatedCoolantFilled", "getHeatedCoolantCapacity", "getHeatedCoolantFilledPercentage")
-
-  local damage_pct  = safe_call(reactor, "getDamagePercent")
-  local burn_now    = safe_call(reactor, "getActualBurnRate")
-  local burn_max    = safe_call(reactor, "getMaxBurnRate")
-
-  -- safety logic
-  if type(damage_pct) == "number" and damage_pct > DAMAGE_LOCK_PCT then
-    if not locked_trip then
-      set_trip("damage high", true)
-    end
-  end
-
-  if locked_trip then
-    -- absolute stop
-    safe_call(reactor, "scram")
+  -- display temp
+  if okTemp and type(tK) == "number" then
+    local c = tempC(tK)
+    writeAt(XVAL, 4, string.format("%.1f c", c), colors.orange)
   else
-    -- trip conditions (forced stop with auto reset)
-    if forced_trip == false then
-      if type(coolant_pct) == "number" and coolant_pct < COOL_STOP then
-        set_trip("coolant low", false)
-      elseif type(temp_c) == "number" and temp_c > TEMP_STOP_C then
-        set_trip("temp high", false)
-      elseif type(heated_pct) == "number" and heated_pct > HEAT_STOP then
-        set_trip("heated high", false)
-      elseif type(waste_pct) == "number" and waste_pct > WASTE_STOP then
-        set_trip("waste high", false)
-      end
-    end
-
-    -- apply stop if forced
-    if forced_trip then
-      safe_call(reactor, "scram")
-      -- reset conditions
-      local can_reset = true
-
-      if trip_cause == "coolant low" then
-        can_reset = (type(coolant_pct) == "number" and coolant_pct > COOL_RESET)
-      elseif trip_cause == "temp high" then
-        can_reset = (type(temp_c) == "number" and temp_c < TEMP_RESET_C)
-      elseif trip_cause == "heated high" then
-        can_reset = (type(heated_pct) == "number" and heated_pct <= HEAT_RESET)
-      elseif trip_cause == "waste high" then
-        can_reset = (type(waste_pct) == "number" and waste_pct < WASTE_RESET)
-      end
-
-      if can_reset then
-        clear_trip()
-      end
-    end
-
-    -- auto start/stop
-    if auto and (not forced_trip) then
-      safe_call(reactor, "activate")
-    else
-      -- if not auto, do not force off (you can keep manual)
-      -- uncomment next line if you want auto lever to also stop reactor
-      -- safe_call(reactor, "scram")
-    end
-
-    -- burn control (only coolant reactive)
-    if auto and (not forced_trip) and (type(burn_max) == "number") and burn_max > 0 then
-      local min_burn = burn_max * MIN_BURN_FRAC
-      local target
-
-      if type(coolant_pct) ~= "number" then
-        target = min_burn
-      elseif coolant_pct <= COOLANT_LOW then
-        target = min_burn
-      else
-        -- linear scale: at COOLANT_FULL => burn_max
-        target = burn_max * (coolant_pct / COOLANT_FULL)
-        target = clamp(target, min_burn, burn_max)
-      end
-
-      -- ramp to avoid oscillations
-      local current = burn_now
-      if type(current) ~= "number" then current = 0 end
-      local step = burn_max * RAMP_STEP_FRAC
-      local delta = target - current
-      if delta > step then delta = step end
-      if delta < -step then delta = -step end
-      local new_burn = clamp(current + delta, 0, burn_max)
-
-      safe_call(reactor, "setBurnRate", new_burn)
-    end
+    writeAt(XVAL, 4, "n/a", colors.gray)
   end
 
-  -- update alarms
-  update_alarm(now)
+  -- bars + percent
+  writeAt(XBAR, 6, bar01(coolP, BARW), colors.lightBlue)
+  writeAt(XVAL, 6, pctStr01(coolP), colors.lightBlue)
 
-  -- =========================
-  -- ui update (no flicker)
-  -- =========================
-  -- auto
-  if auto ~= last_auto then
-    clear_line(4)
-    cwrite(1, 4, colors.white, "auto:")
-    cwrite(7, 4, auto and colors.lime or colors.red, auto and "on" or "off")
-    last_auto = auto
-  end
+  writeAt(XBAR, 7, bar01(fuelP, BARW), colors.lime)
+  writeAt(XVAL, 7, pctStr01(fuelP), colors.lime)
 
-  -- state text
-  local state_txt = "off"
-  local state_col = colors.red
-  if locked_trip then
-    state_txt = "locked"
-    state_col = colors.red
-  elseif forced_trip then
-    state_txt = "forced"
-    state_col = colors.red
-  else
-    if active then
-      state_txt = "on"
-      state_col = colors.lime
-    else
-      state_txt = "off"
-      state_col = colors.red
-    end
-  end
+  writeAt(XBAR, 8, bar01(wasteP, BARW), colors.magenta)
+  writeAt(XVAL, 8, pctStr01(wasteP), colors.magenta)
 
-  if state_txt ~= last_state then
-    clear_line(5)
-    cwrite(1, 5, colors.white, "state:")
-    cwrite(8, 5, state_col, state_txt)
-    last_state = state_txt
-  end
-
-  -- cause
-  local cause_txt = forced_trip and trip_cause or "-"
-  if cause_txt ~= last_cause then
-    clear_line(6)
-    cwrite(1, 6, colors.white, "cause:")
-    cwrite(8, 6, forced_trip and colors.red or colors.gray, cause_txt)
-    last_cause = cause_txt
-  end
-
-  -- temp
-  local temp_txt = "n/a"
-  if type(temp_c) == "number" then
-    temp_txt = string.format("%.1f c", temp_c)
-  end
-  if temp_txt ~= last_temp then
-    -- temp position
-    local tx = math.floor(W/2) - 1
-    clear_line(6) -- keep cause? we already redraw line 6, so rewrite both blocks
-    -- rewrite left cause line
-    cwrite(1, 6, colors.white, "cause:")
-    cwrite(8, 6, forced_trip and colors.red or colors.gray, cause_txt)
-    -- rewrite temp
-    cwrite(math.floor(W/2) - 6, 6, colors.white, "temp:")
-    cwrite(math.floor(W/2), 6, colors.orange, temp_txt)
-    last_temp = temp_txt
-  end
-
-  -- bars + percents
-  local y0 = 8
-  local bar_x = 9
-  local bar_w = math.max(10, W - bar_x - 2)
-
-  local function upd_bar(idx, label, p, col)
-    local y = y0 + idx
-    local k = label .. "_bar"
-    local txt = "[" .. bar(p, bar_w - 2) .. "]"
-    if last_vals[k] ~= txt then
-      term.setCursorPos(bar_x, y)
-      term.setTextColor(colors.gray)
-      term.write(txt .. string.rep(" ", math.max(0, W - (bar_x + #txt) + 1)))
-      last_vals[k] = txt
-    end
-  end
-
-  upd_bar(0, "coolant", coolant_pct, colors.lightBlue)
-  upd_bar(1, "fuel",    fuel_pct,    colors.lime)
-  upd_bar(2, "waste",   waste_pct,   colors.purple)
-  upd_bar(3, "heated",  heated_pct,  colors.orange)
-
-  -- percents list
-  local yv = y0 + 5
-  local vx = 10
-
-  local function upd_val(idx, label, p, col)
-    local y = yv + idx
-    local txt = fmt_pct(p)
-    local k = label .. "_pct"
-    if last_vals[k] ~= txt then
-      -- clear right side area only
-      term.setCursorPos(vx, y)
-      term.setTextColor(col)
-      term.write(txt .. string.rep(" ", math.max(0, W - (vx + #txt) + 1)))
-      last_vals[k] = txt
-    end
-  end
-
-  upd_val(0, "coolant", coolant_pct, colors.lightBlue)
-  upd_val(1, "fuel",    fuel_pct,    colors.lime)
-  upd_val(2, "waste",   waste_pct,   colors.purple)
-  upd_val(3, "heated",  heated_pct,  colors.orange)
+  writeAt(XBAR, 9, bar01(heatP, BARW), colors.orange)
+  writeAt(XVAL, 9, pctStr01(heatP), colors.orange)
 
   -- damage
-  do
-    local y = yv + 4
-    local txt = "n/a"
-    if type(damage_pct) == "number" then
-      txt = string.format("%.1f%%", damage_pct)
-    end
-    if last_vals["damage"] ~= txt then
-      term.setCursorPos(vx, y)
-      term.setTextColor(colors.white)
-      term.write(txt .. string.rep(" ", math.max(0, W - (vx + #txt) + 1)))
-      last_vals["damage"] = txt
-    end
+  if okDmg and type(dmg) == "number" then
+    writeAt(XVAL, 11, string.format("%.1f%%", dmg), dmg > 0 and colors.red or colors.white)
+  else
+    writeAt(XVAL, 11, "n/a", colors.gray)
   end
 
-  -- burn
-  do
-    local y = yv + 6
-    local txt = "n/a"
-    if type(burn_now) == "number" and type(burn_max) == "number" then
-      txt = string.format("%.2f / %.2f", burn_now, burn_max)
+  -- burn display
+  if okBurn and type(burn) == "number" and okMaxBurn and type(maxBurn) == "number" then
+    writeAt(XVAL, 12, string.format("%.2f / %.2f", burn, maxBurn), colors.white)
+  else
+    writeAt(XVAL, 12, "n/a", colors.gray)
+  end
+
+  -- auto burn control (coolant only)
+  if AUTO and okCoolP and type(coolP) == "number" and okBurn and type(burn) == "number" then
+    local target
+    if coolP <= COOLANT_LOW then
+      target = 0
+    elseif coolP >= COOLANT_FULL then
+      target = maxBurn or burn
+      if type(target) ~= "number" then target = burn end
+    else
+      -- map coolant from low..full -> minburn..max
+      local k = (coolP - COOLANT_LOW) / (COOLANT_FULL - COOLANT_LOW)
+      local m = (type(maxBurn) == "number") and maxBurn or burn
+      target = MIN_BURN * m + k * (m - MIN_BURN * m)
     end
-    if last_vals["burn"] ~= txt then
-      clear_line(y)
-      cwrite(1, y, colors.white, "burn:")
-      cwrite(7, y, colors.yellow, txt)
-      last_vals["burn"] = txt
+
+    -- enforce min burn if target > 0
+    if target > 0 and type(maxBurn) == "number" then
+      target = clamp(target, MIN_BURN * maxBurn, maxBurn)
     end
+
+    -- smooth changes
+    if lastBurn == nil then lastBurn = burn end
+    local step = clamp(target - burn, -MAX_STEP, MAX_STEP)
+    local newBurn = burn + step
+
+    -- avoid spamming setBurnRate if same
+    if math.abs(newBurn - burn) >= 0.01 then
+      local okSet, e = safeCall(reactor, "setBurnRate", newBurn)
+      if not okSet then
+        err = (err ~= "" and (err .. " | ") or "") .. "setBurnRate " .. tostring(e)
+      end
+    end
+    lastBurn = newBurn
+  end
+
+  -- error line (top right)
+  if err == "" then
+    writeAt(mw - 15, 2, "err: none", colors.gray)
+  else
+    -- keep it short
+    local short = err
+    if #short > 40 then short = string.sub(short, 1, 40) .. "..." end
+    writeAt(mw - 15, 2, "err: " .. short, colors.red)
   end
 
   sleep(LOOP_SEC)
