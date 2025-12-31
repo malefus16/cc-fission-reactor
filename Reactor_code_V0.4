@@ -1,0 +1,131 @@
+-- ===============================
+-- fission reactor control v0.4
+-- stable percentage version
+-- ===============================
+
+-- peripherals
+local reactor = peripheral.wrap("fissionreactorlogicadapter_0")
+if not reactor then
+  error("reactor not found")
+end
+
+local mon = peripheral.wrap("monitor_7")
+if not mon then
+  error("monitor not found")
+end
+
+-- monitor setup
+mon.setTextScale(0.5)
+mon.setBackgroundColor(colors.black)
+mon.clear()
+
+-- utils
+local function pct01(v)
+  if type(v) ~= "number" then return "n/a" end
+  return string.format("%.1f%%", v * 100)
+end
+
+local function tempc(k)
+  if type(k) ~= "number" then return "n/a" end
+  return string.format("%.1f c", k - 273.15)
+end
+
+local function safe(f)
+  local ok, v = pcall(f)
+  if ok then return v end
+  return nil
+end
+
+-- draw
+local function draw()
+  mon.clear()
+  mon.setCursorPos(1,1)
+  mon.setTextColor(colors.cyan)
+  mon.write("control fission reactor")
+
+  mon.setCursorPos(1,2)
+  mon.setTextColor(colors.gray)
+  mon.write("fissionreactorlogicadapter_0")
+
+  -- state
+  local status = safe(reactor.getStatus)
+  mon.setCursorPos(1,4)
+  mon.setTextColor(colors.white)
+  mon.write("state: ")
+  if status == "running" then
+    mon.setTextColor(colors.lime)
+    mon.write("on")
+  else
+    mon.setTextColor(colors.red)
+    mon.write("off")
+  end
+
+  -- temperature
+  local t = safe(reactor.getTemperature)
+  mon.setCursorPos(1,5)
+  mon.setTextColor(colors.white)
+  mon.write("temp: ")
+  mon.setTextColor(colors.orange)
+  mon.write(tempc(t))
+
+  -- bars title
+  mon.setCursorPos(1,7)
+  mon.setTextColor(colors.lightGray)
+  mon.write("coolant")
+  mon.setCursorPos(1,8)
+  mon.write("fuel")
+  mon.setCursorPos(1,9)
+  mon.write("waste")
+  mon.setCursorPos(1,10)
+  mon.write("heated")
+
+  -- percentages
+  local cool = safe(reactor.getCoolantFilledPercentage)
+  local fuel = safe(reactor.getFuelFilledPercentage)
+  local waste = safe(reactor.getWasteFilledPercentage)
+  local heat = safe(reactor.getHeatedCoolantFilledPercentage)
+
+  mon.setCursorPos(10,7)
+  mon.setTextColor(colors.lightBlue)
+  mon.write(pct01(cool))
+
+  mon.setCursorPos(10,8)
+  mon.setTextColor(colors.green)
+  mon.write(pct01(fuel))
+
+  mon.setCursorPos(10,9)
+  mon.setTextColor(colors.purple)
+  mon.write(pct01(waste))
+
+  mon.setCursorPos(10,10)
+  mon.setTextColor(colors.yellow)
+  mon.write(pct01(heat))
+
+  -- damage
+  local dmg = safe(reactor.getDamagePercent)
+  mon.setCursorPos(1,12)
+  mon.setTextColor(colors.white)
+  mon.write("damage: ")
+  mon.setTextColor(colors.red)
+  mon.write(pct01(dmg))
+
+  -- burn rate
+  local burn = safe(reactor.getActualBurnRate)
+  local burnmax = safe(reactor.getMaxBurnRate)
+
+  mon.setCursorPos(1,13)
+  mon.setTextColor(colors.white)
+  mon.write("burn: ")
+  mon.setTextColor(colors.lime)
+  if type(burn) == "number" and type(burnmax) == "number" then
+    mon.write(string.format("%.2f / %.2f", burn, burnmax))
+  else
+    mon.write("n/a")
+  end
+end
+
+-- main loop
+while true do
+  draw()
+  sleep(0.5)
+end
