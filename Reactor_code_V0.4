@@ -1,131 +1,172 @@
--- ===============================
--- fission reactor control v0.4
--- stable percentage version
--- ===============================
+-- reactor_code_v0_4
+-- cc:tweaked + mekanism fissionreactorlogicadapter
+-- full code, with required capitals in method names
+-- stable display (no flicker) + percent bars with -
 
--- peripherals
-local reactor = peripheral.wrap("fissionreactorlogicadapter_0")
-if not reactor then
-  error("reactor not found")
+-- ===== config =====
+local MONITOR_NAME = "monitor_7"
+local REACTOR_NAME = "fissionReactorLogicAdapter_0"
+local LOOP_SEC = 0.5
+local TEXT_SCALE = 0.5
+
+-- bar layout
+local BAR_W = 24
+local BAR_X = 10
+local LABEL_X = 1
+local VALUE_X = BAR_X + BAR_W + 3
+
+-- ===== find peripherals =====
+local monitor = peripheral.wrap(MONITOR_NAME) or peripheral.find("monitor")
+if not monitor then error("no monitor found") end
+
+local reactor = peripheral.wrap(REACTOR_NAME) or peripheral.find("fissionReactorLogicAdapter")
+if not reactor then error("no fissionReactorLogicAdapter found") end
+
+-- ===== helpers =====
+local function clamp(v, a, b)
+  if v < a then return a end
+  if v > b then return b end
+  return v
 end
 
-local mon = peripheral.wrap("monitor_7")
-if not mon then
-  error("monitor not found")
-end
-
--- monitor setup
-mon.setTextScale(0.5)
-mon.setBackgroundColor(colors.black)
-mon.clear()
-
--- utils
-local function pct01(v)
-  if type(v) ~= "number" then return "n/a" end
-  return string.format("%.1f%%", v * 100)
-end
-
-local function tempc(k)
-  if type(k) ~= "number" then return "n/a" end
-  return string.format("%.1f c", k - 273.15)
-end
-
-local function safe(f)
-  local ok, v = pcall(f)
-  if ok then return v end
+local function safeCall(obj, method)
+  if not obj or not method then return nil end
+  local fn = obj[method]
+  if type(fn) ~= "function" then return nil end
+  local ok, res = pcall(fn, obj)
+  if ok then return res end
   return nil
 end
 
--- draw
-local function draw()
-  mon.clear()
-  mon.setCursorPos(1,1)
-  mon.setTextColor(colors.cyan)
-  mon.write("control fission reactor")
+local function padRight(s, n)
+  s = tostring(s or "")
+  if #s >= n then return s end
+  return s .. string.rep(" ", n - #s)
+end
 
-  mon.setCursorPos(1,2)
-  mon.setTextColor(colors.gray)
-  mon.write("fissionreactorlogicadapter_0")
+local function clearLine(y)
+  local w, _ = monitor.getSize()
+  monitor.setCursorPos(1, y)
+  monitor.write(string.rep(" ", w))
+end
 
-  -- state
-  local status = safe(reactor.getStatus)
-  mon.setCursorPos(1,4)
-  mon.setTextColor(colors.white)
-  mon.write("state: ")
-  if status == "running" then
-    mon.setTextColor(colors.lime)
-    mon.write("on")
-  else
-    mon.setTextColor(colors.red)
-    mon.write("off")
+local function writeAt(x, y, text)
+  monitor.setCursorPos(x, y)
+  monitor.write(text)
+end
+
+local function setTextColorSafe(color)
+  if monitor.setTextColor then monitor.setTextColor(color) end
+end
+
+local function setBgColorSafe(color)
+  if monitor.setBackgroundColor then monitor.setBackgroundColor(color) end
+end
+
+local function drawBar(x, y, w, percent)
+  percent = clamp(percent or 0, 0, 100)
+  local fill = math.floor((percent / 100) * w + 0.00001)
+
+  writeAt(x, y, "[")
+  writeAt(x + 1, y, string.rep("#", fill) .. string.rep("-", w - fill))
+  writeAt(x + 1 + w, y, "]")
+end
+
+local function fmtPct(v)
+  if v == nil then return "n/a" end
+  return string.format("%5.1f%%", v)
+end
+
+local function fmtTempC(kelvin)
+  if kelvin == nil then return "n/a" end
+  local c = kelvin - 273.15
+  return string.format("%.1f c", c)
+end
+
+local function statusToText(st)
+  if st == nil then return "n/a" end
+  if type(st) == "boolean" then
+    return st and "on" or "off"
   end
+  return tostring(st)
+end
 
-  -- temperature
-  local t = safe(reactor.getTemperature)
-  mon.setCursorPos(1,5)
-  mon.setTextColor(colors.white)
-  mon.write("temp: ")
-  mon.setTextColor(colors.orange)
-  mon.write(tempc(t))
+-- ===== init screen (clear once, no flicker) =====
+monitor.setTextScale(TEXT_SCALE)
+setBgColorSafe(colors.black)
+setTextColorSafe(colors.white)
+monitor.clear()
 
-  -- bars title
-  mon.setCursorPos(1,7)
-  mon.setTextColor(colors.lightGray)
-  mon.write("coolant")
-  mon.setCursorPos(1,8)
-  mon.write("fuel")
-  mon.setCursorPos(1,9)
-  mon.write("waste")
-  mon.setCursorPos(1,10)
-  mon.write("heated")
+writeAt(1, 1, "control fission reactor")
+writeAt(1, 2, REACTOR_NAME)
 
-  -- percentages
-  local cool = safe(reactor.getCoolantFilledPercentage)
-  local fuel = safe(reactor.getFuelFilledPercentage)
-  local waste = safe(reactor.getWasteFilledPercentage)
-  local heat = safe(reactor.getHeatedCoolantFilledPercentage)
+writeAt(1, 4, "state:")
+writeAt(1, 5, "temp:")
 
-  mon.setCursorPos(10,7)
-  mon.setTextColor(colors.lightBlue)
-  mon.write(pct01(cool))
+writeAt(LABEL_X, 7, "coolant")
+writeAt(LABEL_X, 8, "fuel")
+writeAt(LABEL_X, 9, "waste")
+writeAt(LABEL_X, 10, "heated")
 
-  mon.setCursorPos(10,8)
-  mon.setTextColor(colors.green)
-  mon.write(pct01(fuel))
+writeAt(LABEL_X, 12, "damage:")
+writeAt(LABEL_X, 13, "burn:")
 
-  mon.setCursorPos(10,9)
-  mon.setTextColor(colors.purple)
-  mon.write(pct01(waste))
+-- ===== main loop =====
+while true do
+  -- read data (keep exact method name capitals)
+  local tempK   = safeCall(reactor, "getTemperature")
+  local coolant = safeCall(reactor, "getCoolantFilledPercentage")
+  local fuel    = safeCall(reactor, "getFuelFilledPercentage")
+  local waste   = safeCall(reactor, "getWasteFilledPercentage")
+  local heated  = safeCall(reactor, "getHeatedCoolantFilledPercentage")
+  local dmg     = safeCall(reactor, "getDamagePercent")
+  local burn    = safeCall(reactor, "getActualBurnRate")
+  local burnMax = safeCall(reactor, "getMaxBurnRate")
+  local st      = safeCall(reactor, "getStatus")
 
-  mon.setCursorPos(10,10)
-  mon.setTextColor(colors.yellow)
-  mon.write(pct01(heat))
+  -- state line
+  clearLine(4)
+  writeAt(1, 4, "state: " .. statusToText(st))
+
+  -- temp line
+  clearLine(5)
+  writeAt(1, 5, "temp:  " .. fmtTempC(tempK) .. "   ")
+
+  -- bars
+  drawBar(BAR_X, 7, BAR_W, coolant or 0)
+  drawBar(BAR_X, 8, BAR_W, fuel or 0)
+  drawBar(BAR_X, 9, BAR_W, waste or 0)
+  drawBar(BAR_X, 10, BAR_W, heated or 0)
+
+  -- values (right side)
+  clearLine(7)
+  writeAt(LABEL_X, 7, "coolant")
+  writeAt(VALUE_X, 7, fmtPct(coolant))
+
+  clearLine(8)
+  writeAt(LABEL_X, 8, "fuel")
+  writeAt(VALUE_X, 8, fmtPct(fuel))
+
+  clearLine(9)
+  writeAt(LABEL_X, 9, "waste")
+  writeAt(VALUE_X, 9, fmtPct(waste))
+
+  clearLine(10)
+  writeAt(LABEL_X, 10, "heated")
+  writeAt(VALUE_X, 10, fmtPct(heated))
 
   -- damage
-  local dmg = safe(reactor.getDamagePercent)
-  mon.setCursorPos(1,12)
-  mon.setTextColor(colors.white)
-  mon.write("damage: ")
-  mon.setTextColor(colors.red)
-  mon.write(pct01(dmg))
+  clearLine(12)
+  writeAt(1, 12, "damage: " .. (dmg and string.format("%.1f%%", dmg) or "n/a") .. "   ")
 
-  -- burn rate
-  local burn = safe(reactor.getActualBurnRate)
-  local burnmax = safe(reactor.getMaxBurnRate)
-
-  mon.setCursorPos(1,13)
-  mon.setTextColor(colors.white)
-  mon.write("burn: ")
-  mon.setTextColor(colors.lime)
-  if type(burn) == "number" and type(burnmax) == "number" then
-    mon.write(string.format("%.2f / %.2f", burn, burnmax))
-  else
-    mon.write("n/a")
+  -- burn
+  clearLine(13)
+  local burnTxt = "n/a"
+  if burn ~= nil and burnMax ~= nil then
+    burnTxt = string.format("%.2f / %.2f", burn, burnMax)
   end
-end
+  writeAt(1, 13, "burn:   " .. burnTxt .. "   ")
 
--- main loop
-while true do
-  draw()
-  sleep(0.5)
+  sleep(LOOP_SEC)
 end
+```0
