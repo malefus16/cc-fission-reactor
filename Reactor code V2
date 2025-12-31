@@ -1,0 +1,211 @@
+-------------------------------
+-- CONFIG
+-------------------------------
+local AUTO_SIDE = "left"
+local LOOP_SEC = 0.5
+
+-- Burn rate piloté par coolant
+local COOLANT_FULL = 0.80
+local COOLANT_LOW  = 0.10
+local MIN_BURN     = 0.20
+local RAMP_STEP    = 0.20
+
+-- Sécurités
+local TEMP_STOP  = 800     -- °C
+local TEMP_RESET = 100
+
+local HEAT_STOP  = 0.80
+local HEAT_RESET = 0.00
+
+local WASTE_STOP  = 0.80
+local WASTE_RESET = 0.50
+
+local DAMAGE_STOP = 30
+
+-------------------------------
+-- INIT
+-------------------------------
+local mon = peripheral.find("monitor")
+local reactor = peripheral.find("fissionReactorLogicAdapter")
+
+if not reactor then
+  error("Aucun fissionReactorLogicAdapter trouvé")
+end
+
+if mon then
+  mon.setTextScale(0.5)
+end
+
+-------------------------------
+-- UTILS
+-------------------------------
+local function safeCall(p, m)
+  if not p[m] then return nil end
+  local ok, v = pcall(p[m])
+  if ok then return v end
+  return nil
+end
+
+local function clamp(x,a,b)
+  return math.max(a, math.min(b,x))
+end
+
+local function pct(v)
+  if type(v) ~= "number" then return "N/A" end
+  return string.format("%.1f%%", v*100)
+end
+
+local function reactorRunning(r)
+  local br = safeCall(r,"getActualBurnRate")
+  return type(br)=="number" and br>0
+end
+
+-------------------------------
+-- DATA READ
+-------------------------------
+local function getTempC(r)
+  local k = safeCall(r,"getTemperature")
+  if type(k)~="number" then return nil end
+  return k - 273.15
+end
+
+local function getCoolantPct(r)
+  return safeCall(r,"getCoolantFilledPercentage")
+end
+
+local function getHeatedPct(r)
+  return safeCall(r,"getHeatedCoolantFilledPercentage")
+end
+
+local function getWastePct(r)
+  return safeCall(r,"getWasteFilledPercentage")
+end
+
+local function getFuelPct(r)
+  return safeCall(r,"getFuelFilledPercentage")
+end
+
+local function getDamage(r)
+  return safeCall(r,"getDamagePercent")
+end
+
+-------------------------------
+-- DISPLAY
+-------------------------------
+local function draw(label,value,y,color)
+  if not mon then return end
+  mon.setCursorPos(1,y)
+  mon.setTextColor(colors.white)
+  mon.write(label)
+  mon.setTextColor(color or colors.white)
+  mon.write(tostring(value))
+end
+
+-------------------------------
+-- MAIN LOOP
+-------------------------------
+local lockedStop = false
+local stopReason = "-"
+
+while true do
+  local auto = redstone.getInput(AUTO_SIDE)
+
+  local temp = getTempC(reactor)
+  local coolant = getCoolantPct(reactor)
+  local heated = getHeatedPct(reactor)
+  local waste = getWastePct(reactor)
+  local fuel = getFuelPct(reactor)
+  local damage = getDamage(reactor)
+
+  local forcedStop = false
+  stopReason = "-"
+
+  if damage and damage > DAMAGE_STOP then
+    lockedStop = true
+    stopReason = "Degats reacteur"
+  end
+
+  if temp and temp > TEMP_STOP then
+    forcedStop = true
+    stopReason = "Temperature elevee"
+  elseif temp and temp < TEMP_RESET then
+    forcedStop = false
+  end
+
+  if coolant and coolant < COOLANT_LOW then
+    forcedStop = true
+    stopReason = "Coolant bas"
+  elseif coolant and coolant > COOLANT_FULL then
+    forcedStop = false
+  end
+
+  if heated and heated > HEAT_STOP then
+    forcedStop = true
+    stopReason = "Heated plein"
+  elseif heated and heated <= HEAT_RESET then
+    forcedStop = false
+  end
+
+  if waste and waste > WASTE_STOP then
+    forcedStop = true
+    stopReason = "Waste plein"
+  elseif waste and waste < WASTE_RESET then
+    forcedStop = false
+  end
+
+  if lockedStop or not auto or forcedStop then
+    reactor.scram()
+  else
+    local burn = safeCall(reactor,"getActualBurnRate") or 0
+    local target = MIN_BURN
+
+    if coolant then
+      if coolant > COOLANT_FULL then
+        target = safeCall(reactor,"getMaxBurnRate") or MIN_BURN
+      elseif coolant > COOLANT_LOW then
+        target = MIN_BURN + (coolant-COOLANT_LOW)/(COOLANT_FULL-COOLANT_LOW)
+      end
+    end
+
+    target = clamp(target,MIN_BURN,safeCall(reactor,"getMaxBurnRate") or MIN_BURN)
+
+    if burn < target then
+      reactor.setBurnRate(math.min(burn+RAMP_STEP,target))
+    elseif burn > target then
+      reactor.setBurnRate(math.max(burn-RAMP_STEP,target))
+    end
+
+    reactor.activate()
+  end
+
+  local active = reactorRunning(reactor)
+
+  if mon then
+    mon.clear()
+    draw("=== CONTROLE REACTEUR FISSION ===","",1,colors.cyan)
+
+    draw("Marche auto: ", auto and "ACTIVE" or "OFF",3, auto and colors.green or colors.red)
+
+    if lockedStop then
+      draw("Etat reacteur: ","ARRET DEFINITIF",4,colors.red)
+    elseif forcedStop then
+      draw("Etat reacteur: ","ARRET FORCE",4,colors.red)
+    elseif active then
+      draw("Etat reacteur: ","ALLUME",4,colors.green)
+    else
+      draw("Etat reacteur: ","ETEINT",4,colors.gray)
+    end
+
+    draw("Cause: ",stopReason,5,colors.red)
+
+    draw("Temperature: ", temp and string.format("%.1f C",temp) or "N/A",7)
+    draw("Coolant: ", pct(coolant),8)
+    draw("Fuel: ", pct(fuel),9)
+    draw("Waste: ", pct(waste),10)
+    draw("Heated: ", pct(heated),11)
+    draw("Damage: ", damage and string.format("%.1f%%",damage) or "N/A",12)
+    draw("Burn rate: ", safeCall(reactor,"getActualBurnRate") or 0,13)
+  end
+
+  sleep(LOOP_SEC)
+end
