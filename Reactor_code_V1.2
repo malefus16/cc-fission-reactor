@@ -1,0 +1,452 @@
+-- reactor code v1 (single file) - fixed method names + start order
+
+-- ===== config =====
+local reactor_name = "fissionReactorLogicAdapter_0"
+local monitor_name = "monitor_7" -- your 7x6 monitor
+
+local auto_side = "left"
+local loop_sec = 0.5
+
+-- display
+local text_scale = 2.0
+
+-- burn rate driven by coolant
+local coolant_full = 0.80
+local coolant_low = 0.10
+local min_burn = 0.10
+local ramp_step = 0.20
+
+-- safety thresholds
+local temp_stop_c = 800.0
+local temp_reset_c = 100.0
+
+local coolant_stop = 0.05
+local coolant_reset = 0.80
+
+local heated_stop = 0.80
+local heated_reset = 0.00
+
+local waste_stop = 0.80
+local waste_reset = 0.50
+
+local damage_stop = 30.0
+
+-- alarms
+local beep_sound = "minecraft:block.note_block.bell"
+local beep_vol = 1.5
+local beep_pitch = 1.2
+local forced_alarm_sec = 3.0
+local beep_period = 0.35
+
+-- ===== utils =====
+local function safe_call(obj, method_name, ...)
+  if not obj then return nil end
+  local fn = obj[method_name]
+  if type(fn) ~= "function" then return nil end
+  local ok, res = pcall(fn, obj, ...)
+  if not ok then return nil end
+  return res
+end
+
+local function clamp(x, a, b)
+  if x < a then return a end
+  if x > b then return b end
+  return x
+end
+
+local function clamp01(x)
+  return clamp(x, 0, 1)
+end
+
+local function norm_pct(v)
+  if v == nil or type(v) ~= "number" then return nil end
+  if v > 1 then v = v / 100 end
+  return clamp01(v)
+end
+
+local function pct_str(x)
+  if x == nil then return "n/a" end
+  return string.format("%.1f%%", x * 100)
+end
+
+-- ===== exact mekanism method names (fix for n/a) =====
+local m = {
+  get_temperature = "getTemperature",
+  get_coolant_filled_percentage = "getCoolantFilledPercentage",
+  get_fuel_filled_percentage = "getFuelFilledPercentage",
+  get_waste_filled_percentage = "getWasteFilledPercentage",
+  get_heated_coolant_filled_percentage = "getHeatedCoolantFilledPercentage",
+  get_damage_percent = "getDamagePercent",
+  get_max_burn_rate = "getMaxBurnRate",
+  get_actual_burn_rate = "getActualBurnRate",
+  is_formed = "isFormed",
+  activate = "activate",
+  scram = "scram",
+  set_burn_rate = "setBurnRate",
+}
+
+-- ===== peripherals =====
+local mon = peripheral.wrap(monitor_name)
+if not mon then mon = peripheral.find("monitor") end
+
+local speaker = peripheral.find("speaker")
+
+-- reactor peripheral (forced name then fallback by type)
+local r = peripheral.wrap(reactor_name)
+if not r then
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "fissionreactorlogicadapter" then
+      r = peripheral.wrap(n)
+      reactor_name = n
+      break
+    end
+  end
+end
+
+if not r then
+  print("no reactor adapter found. peripherals:")
+  for _, n in ipairs(peripheral.getNames()) do
+    print(" - " .. n .. " (" .. tostring(peripheral.getType(n)) .. ")")
+  end
+  error("no fissionreactorlogicadapter found")
+end
+
+if mon then
+  mon.setTextScale(text_scale)
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+end
+
+-- ===== sensors =====
+local function temp_c()
+  local k = safe_call(r, m.get_temperature)
+  if type(k) ~= "number" then return nil end
+  return k - 273.15
+end
+
+local function coolant_pct()
+  return norm_pct(safe_call(r, m.get_coolant_filled_percentage))
+end
+
+local function fuel_pct()
+  return norm_pct(safe_call(r, m.get_fuel_filled_percentage))
+end
+
+local function waste_pct()
+  return norm_pct(safe_call(r, m.get_waste_filled_percentage))
+end
+
+local function heated_pct()
+  return norm_pct(safe_call(r, m.get_heated_coolant_filled_percentage))
+end
+
+local function damage_pct()
+  local d = safe_call(r, m.get_damage_percent)
+  if type(d) == "number" then return d end
+  return nil
+end
+
+local function burn_rate()
+  local b = safe_call(r, m.get_actual_burn_rate)
+  if type(b) == "number" then return b end
+  return 0
+end
+
+local function max_burn_rate()
+  local b = safe_call(r, m.get_max_burn_rate)
+  if type(b) == "number" then return b end
+  return 0
+end
+
+local function is_running()
+  return burn_rate() > 0
+end
+
+-- ===== control =====
+local locked_stop = false
+local locked_reason = "none"
+
+local forced_stop = false
+local forced_reason = "none"
+
+local forced_alarm_until = 0
+local prev_forced = false
+
+local function reactor_on()
+  safe_call(r, m.activate)
+end
+
+local function reactor_off()
+  safe_call(r, m.scram)
+end
+
+local function set_burn(v)
+  safe_call(r, m.set_burn_rate, v)
+end
+
+local function compute_target(maxb, cool)
+  if maxb <= 0 then return 0 end
+  if cool == nil then return maxb * min_burn end
+
+  local c0 = clamp01(cool)
+  if c0 <= coolant_low then return maxb * min_burn end
+  if c0 >= coolant_full then return maxb end
+
+  local t = (c0 - coolant_low) / (coolant_full - coolant_low)
+  local f = min_burn + t * (1 - min_burn)
+  return maxb * f
+end
+
+-- ===== ui (big layout) =====
+local function bar(x, width)
+  if x == nil then
+    return string.rep("-", width)
+  end
+  local n = math.floor(clamp01(x) * width + 0.5)
+  if n < 0 then n = 0 end
+  if n > width then n = width end
+  return string.rep("#", n) .. string.rep("-", width - n)
+end
+
+local function center(y, text, col)
+  if not mon then return end
+  local mw = ({mon.getSize()})[1]
+  local x = math.floor((mw - #text) / 2) + 1
+  if x < 1 then x = 1 end
+  mon.setCursorPos(x, y)
+  mon.setTextColor(col or colors.white)
+  mon.write(text)
+end
+
+local function label_value(y, label, value, col_label, col_value)
+  if not mon then return end
+  mon.setCursorPos(2, y)
+  mon.setTextColor(col_label or colors.white)
+  mon.write(label)
+  mon.setCursorPos(18, y)
+  mon.setTextColor(col_value or colors.white)
+  mon.write(value)
+end
+
+local function render(st)
+  if not mon then return end
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+
+  center(1, "control fission reactor", colors.cyan)
+  center(2, reactor_name, colors.gray)
+
+  local auto_txt = st.auto and "auto:on" or "auto:off"
+  local auto_col = st.auto and colors.lime or colors.red
+
+  local state_txt = "off"
+  local state_col = colors.gray
+  if st.locked then
+    state_txt = "locked stop"
+    state_col = colors.red
+  elseif st.forced then
+    state_txt = "forced stop"
+    state_col = colors.red
+  elseif st.active then
+    state_txt = "on"
+    state_col = colors.lime
+  end
+
+  mon.setCursorPos(2, 4)
+  mon.setTextColor(auto_col)
+  mon.write(auto_txt)
+
+  mon.setCursorPos(2, 5)
+  mon.setTextColor(state_col)
+  mon.write("state:" .. state_txt)
+
+  local cause = "-"
+  if st.locked then cause = st.locked_reason
+  elseif st.forced then cause = st.forced_reason end
+
+  mon.setCursorPos(2, 6)
+  mon.setTextColor(colors.yellow)
+  mon.write("cause:")
+  mon.setCursorPos(9, 6)
+  mon.setTextColor((st.locked or st.forced) and colors.red or colors.gray)
+  mon.write(cause)
+
+  local tline = "temp: n/a"
+  if st.temp_c ~= nil then
+    tline = string.format("temp: %.1f c", st.temp_c)
+  end
+  local tcol = colors.white
+  if st.temp_c ~= nil and st.temp_c > temp_stop_c then tcol = colors.red end
+  center(8, tline, tcol)
+
+  local mw = ({mon.getSize()})[1]
+  local bw = mw - 12
+  if bw < 10 then bw = 10 end
+
+  local function draw_bar(y, name, val, warn_low, warn_high)
+    mon.setCursorPos(2, y)
+    mon.setTextColor(colors.white)
+    mon.write(name)
+    mon.setCursorPos(10, y)
+    local col = colors.lightGray
+    if val == nil then col = colors.gray
+    elseif warn_low and val < warn_low then col = colors.red
+    elseif warn_high and val > warn_high then col = colors.red
+    else col = colors.lime end
+    mon.setTextColor(col)
+    mon.write("[" .. bar(val, bw) .. "]")
+  end
+
+  draw_bar(10, "coolant", st.coolant, coolant_stop, nil)
+  draw_bar(11, "fuel",    st.fuel,    nil, nil)
+  draw_bar(12, "waste",   st.waste,   nil, waste_stop)
+  draw_bar(13, "heated",  st.heated,  nil, heated_stop)
+
+  label_value(15, "coolant", pct_str(st.coolant), colors.white, colors.lightBlue)
+  label_value(16, "fuel",    pct_str(st.fuel),    colors.white, colors.green)
+  label_value(17, "waste",   pct_str(st.waste),   colors.white, colors.purple)
+  label_value(18, "heated",  pct_str(st.heated),  colors.white, colors.orange)
+
+  local dmg_txt = "n/a"
+  if st.damage ~= nil then dmg_txt = string.format("%.1f%%", st.damage) end
+  local dmg_col = (st.damage ~= nil and st.damage > damage_stop) and colors.red or colors.white
+  label_value(19, "damage", dmg_txt, colors.white, dmg_col)
+
+  center(21, string.format("burn: %.2f / %.2f", st.burn or 0, st.maxb or 0), colors.white)
+  center(22, "min burn 10% | forced alarm 3s | locked alarm cont", colors.gray)
+end
+
+-- ===== alarm loop =====
+local function alarm_loop()
+  while true do
+    local now = os.clock()
+    if locked_stop then
+      if speaker then speaker.playSound(beep_sound, beep_vol, beep_pitch) end
+      sleep(beep_period)
+    elseif now < forced_alarm_until then
+      if speaker then speaker.playSound(beep_sound, beep_vol, beep_pitch) end
+      sleep(beep_period)
+    else
+      sleep(0.1)
+    end
+  end
+end
+
+-- ===== main loop =====
+local function main_loop()
+  while true do
+    local auto = redstone.getInput(auto_side)
+
+    local formed = safe_call(r, m.is_formed)
+    if formed == false then
+      forced_stop = true
+      forced_reason = "not formed"
+      reactor_off()
+    end
+
+    local tc = temp_c()
+    local cool = coolant_pct()
+    local fuel = fuel_pct()
+    local waste = waste_pct()
+    local heat = heated_pct()
+    local dmg = damage_pct()
+
+    -- locked stop
+    if (not locked_stop) and dmg ~= nil and dmg > damage_stop then
+      locked_stop = true
+      locked_reason = "damage high"
+      reactor_off()
+    end
+
+    -- forced stop
+    if (not locked_stop) and (not forced_stop) then
+      if tc ~= nil and tc > temp_stop_c then
+        forced_stop = true
+        forced_reason = "temp high"
+        reactor_off()
+      elseif cool ~= nil and cool < coolant_stop then
+        forced_stop = true
+        forced_reason = "coolant low"
+        reactor_off()
+      elseif heat ~= nil and heat > heated_stop then
+        forced_stop = true
+        forced_reason = "heated high"
+        reactor_off()
+      elseif waste ~= nil and waste > waste_stop then
+        forced_stop = true
+        forced_reason = "waste high"
+        reactor_off()
+      end
+    end
+
+    -- reset forced stop
+    if (not locked_stop) and forced_stop then
+      local ok_temp = (tc == nil) or (tc < temp_reset_c)
+      local ok_cool = (cool == nil) or (cool > coolant_reset)
+      local ok_heat = (heat == nil) or (heat <= heated_reset)
+      local ok_waste = (waste == nil) or (waste < waste_reset)
+
+      if ok_temp and ok_cool and ok_heat and ok_waste then
+        forced_stop = false
+        forced_reason = "none"
+      end
+    end
+
+    -- forced alarm timing
+    if forced_stop and (not prev_forced) then
+      forced_alarm_until = os.clock() + forced_alarm_sec
+    end
+    prev_forced = forced_stop
+
+    -- start/stop (set burn before activate)
+    if locked_stop then
+      reactor_off()
+      set_burn(0)
+    elseif (not auto) then
+      reactor_off()
+      set_burn(0)
+    elseif forced_stop then
+      reactor_off()
+      set_burn(0)
+    else
+      local maxb = max_burn_rate()
+      if maxb > 0 then
+        local target = compute_target(maxb, cool)
+        if target <= 0 then target = maxb * min_burn end
+        set_burn(target)
+      end
+      reactor_on()
+    end
+
+    -- burn regulation (smooth)
+    if auto and (not forced_stop) and (not locked_stop) then
+      local maxb = max_burn_rate()
+      local cur = burn_rate()
+      local target = compute_target(maxb, cool)
+      local diff = clamp(target - cur, -ramp_step, ramp_step)
+      set_burn(cur + diff)
+    end
+
+    local st = {
+      auto = auto,
+      active = is_running(),
+      temp_c = tc,
+      coolant = cool,
+      fuel = fuel,
+      waste = waste,
+      heated = heat,
+      damage = dmg,
+      burn = burn_rate(),
+      maxb = max_burn_rate(),
+      locked = locked_stop,
+      locked_reason = locked_reason,
+      forced = forced_stop,
+      forced_reason = forced_reason,
+    }
+    render(st)
+
+    sleep(loop_sec)
+  end
+end
+
+parallel.waitForAny(main_loop, alarm_loop)
