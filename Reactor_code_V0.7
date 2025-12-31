@@ -1,263 +1,338 @@
--- reactor_code_v0_7_1.lua
--- coolant driven burn control with 40% threshold behavior (as requested)
+-- control fission reactor v0.6
+-- cc:tweaked + mekanism fission reactor logic adapter
+-- note: keep capitals exactly (method names + peripheral type)
 
-local MONITOR_NAME = "monitor_7"
-local REACTOR_NAME = "fissionReactorLogicAdapter_0"
+-------------------------
+-- config
+-------------------------
+local MONITOR_NAME = "monitor_7"                 -- your 7x6 monitor
+local REACTOR_NAME = "fissionReactorLogicAdapter_0" -- optional; auto-detect if not found
 
-local TEXT_SCALE   = 1.8
-local REFRESH_SEC  = 0.25
+local TEXT_SCALE = 1.8
 
--- auto lever
-local AUTO_SIDE    = "left"
-local AUTO_INVERT  = false
+local LOOP_SEC = 0.5
 
--- control behavior
-local COOL_TARGET   = 0.40     -- 40%
-local EPS_DELTA     = 0.002    -- 0.2% to detect real change
-local STEP_UP       = 3.0      -- burn increase when coolant rising
-local STEP_UP_SLOW  = 1.0      -- burn increase when coolant stable
-local K_DOWN        = 900.0    -- proportional gain for decrease when coolant < 40% and falling
--- example: delta=-0.01 => decrease 9 mb/t per loop
+local AUTO_SIDE = "left"     -- redstone lever side for auto enable (left/right/top/bottom/front/back)
+local AUTO_DEFAULT = true    -- if no redstone connected, this is used
 
--- burn limits
-local MIN_BURN_FRAC = 0.10     -- 10% of max (=> 20 when max=200)
+local COOL_TARGET = 0.45     -- 45% target
+local COOL_LOW = 0.40        -- below this, burn decreases strongly
+local COOL_HIGH = 0.80       -- above this, allow more increase (soft)
 
--- safeties
-local COOL_STOP    = 0.05
-local COOL_RESET   = 0.10
+local MIN_BURN = 0.20        -- keep minimum > 0
+local MAX_BURN = 200.00      -- your max burn rate
 
-local HEAT_STOP    = 0.90
-local HEAT_RESET   = 0.80
+local RAMP_UP = 1.0          -- max increase per loop
+local RAMP_DOWN = 2.0        -- max decrease per loop
+local STABLE_BONUS = 0.20    -- slight increase when coolant stable and above target
 
-local WASTE_STOP   = 0.90
-local WASTE_RESET  = 0.80
+local STABLE_EPS = 0.001     -- coolant change considered stable
 
-local DMG_STOP     = 30.0
-local DMG_RESET    = 25.0
+local DAMAGE_LOCK = 30.0     -- lock above 30%
 
--- bars
-local BAR_W = 26
+local TEMP_LOCK_C = 1200.0   -- extra safety (in c) optional
+local HEATED_LOCK = 0.95     -- heated coolant high safety
+local WASTE_LOCK = 0.95      -- waste high safety
 
--- peripherals
-local mon = peripheral.wrap(MONITOR_NAME)
-if not mon then error("monitor not found: " .. MONITOR_NAME) end
-
-local reactor = peripheral.wrap(REACTOR_NAME)
-if not reactor then error("reactor not found: " .. REACTOR_NAME) end
-
--- monitor init
-mon.setTextScale(TEXT_SCALE)
-mon.setBackgroundColor(colors.black)
-mon.setTextColor(colors.white)
-mon.clear()
-
-local W, H = mon.getSize()
-BAR_W = math.max(10, math.min(BAR_W, W - 12))
-
+-------------------------
 -- helpers
-local last_lines = {}
-
-local function setColor(c) mon.setTextColor(c) end
-
-local function drawLine(y, leftText, leftColor, rightText, rightColor)
-  if y < 1 or y > H then return end
-  leftText = leftText or ""
-  rightText = rightText or ""
-  local full = leftText .. "\0" .. rightText .. "\0" .. tostring(leftColor or -1) .. "\0" .. tostring(rightColor or -1)
-  if last_lines[y] == full then return end
-  last_lines[y] = full
-
-  mon.setCursorPos(1, y)
-  mon.write(string.rep(" ", W))
-
-  mon.setCursorPos(1, y)
-  setColor(leftColor or colors.white)
-  mon.write(leftText)
-
-  local rx = W - #rightText + 1
-  if rx < 1 then rx = 1 end
-  mon.setCursorPos(rx, y)
-  setColor(rightColor or colors.white)
-  mon.write(rightText)
-
-  setColor(colors.white)
-end
-
-local function safeCall(fn)
-  local ok, v = pcall(fn)
-  if ok then return true, v end
-  return false, v
-end
-
-local function fmtNum(n, d)
-  if n == nil then return "n/a" end
-  if type(n) ~= "number" then return tostring(n) end
-  d = d or 1
-  local p = 10 ^ d
-  return tostring(math.floor(n * p + 0.5) / p)
-end
-
-local function fmtPct(p)
-  if p == nil or type(p) ~= "number" then return "n/a" end
-  return fmtNum(p * 100, 1) .. "%"
-end
-
-local function bar(p)
-  if p == nil or type(p) ~= "number" then
-    return "[" .. string.rep("-", BAR_W) .. "]"
-  end
-  if p < 0 then p = 0 end
-  if p > 1 then p = 1 end
-  local fill = math.floor(p * BAR_W + 0.5)
-  if fill < 0 then fill = 0 end
-  if fill > BAR_W then fill = BAR_W end
-  return "[" .. string.rep("#", fill) .. string.rep("-", BAR_W - fill) .. "]"
-end
-
+-------------------------
 local function clamp(x, a, b)
   if x < a then return a end
   if x > b then return b end
   return x
 end
 
-local function readAuto()
-  local s = redstone.getInput(AUTO_SIDE)
-  if AUTO_INVERT then s = not s end
+local function fmtNum(x, decimals)
+  if type(x) ~= "number" then return "n/a" end
+  local m = 10 ^ (decimals or 0)
+  local v = math.floor(x * m + 0.5) / m
+  local s = tostring(v)
   return s
 end
 
--- state
-local locked = false
-local locked_reason = "-"
-local last_burn_set = nil
-local last_cool = nil
+local function safeCall(fn)
+  local ok, res = pcall(fn)
+  if ok then return true, res end
+  return false, nil
+end
 
-while true do
-  local auto_on = readAuto()
-
-  local okForce, forceDisabled = safeCall(function() return reactor.isForceDisabled() end)
-  forceDisabled = okForce and forceDisabled or false
-
-  local okStatus, isOn = safeCall(function() return reactor.getStatus() end)
-  local stateTxt = okStatus and (isOn and "on" or "off") or "n/a"
-
-  local okDmg, dmg = safeCall(function() return reactor.getDamagePercent() end)
-
-  local okCFP, coolPct = safeCall(function() return reactor.getCoolantFilledPercentage() end)
-  local okWFP, wastePct = safeCall(function() return reactor.getWasteFilledPercentage() end)
-  local okHFP, heatPct  = safeCall(function() return reactor.getHeatedCoolantFilledPercentage() end)
-
-  local okBR, burn = safeCall(function() return reactor.getBurnRate() end)
-  local okMBR, maxBurn = safeCall(function() return reactor.getMaxBurnRate() end)
-
-  -- ===== safeties =====
-  local trip = nil
-  if forceDisabled then
-    trip = "forced"
-  elseif okDmg and type(dmg)=="number" and dmg >= DMG_STOP then
-    trip = "damage lock"
-  elseif okCFP and type(coolPct)=="number" and coolPct <= COOL_STOP then
-    trip = "coolant low"
-  elseif okHFP and type(heatPct)=="number" and heatPct >= HEAT_STOP then
-    trip = "heated high"
-  elseif okWFP and type(wastePct)=="number" and wastePct >= WASTE_STOP then
-    trip = "waste high"
+local function bar(pct, width)
+  if type(pct) ~= "number" then
+    return "[" .. string.rep("-", width) .. "]"
   end
+  pct = clamp(pct, 0, 1)
+  local fill = math.floor(pct * width + 0.5)
+  if fill < 0 then fill = 0 end
+  if fill > width then fill = width end
+  return "[" .. string.rep("#", fill) .. string.rep("-", width - fill) .. "]"
+end
 
-  if trip ~= nil then
-    locked = true
-    locked_reason = trip
-    safeCall(function() reactor.scram() end)
-  end
+-------------------------
+-- peripherals
+-------------------------
+local mon = peripheral.wrap(MONITOR_NAME)
+if not mon then
+  error("monitor not found: " .. tostring(MONITOR_NAME))
+end
+mon.setTextScale(TEXT_SCALE)
 
-  if locked and (not forceDisabled) then
-    local cool_ok  = (not okCFP) or (type(coolPct)~="number") or (coolPct >= COOL_RESET)
-    local heat_ok  = (not okHFP) or (type(heatPct)~="number") or (heatPct <= HEAT_RESET)
-    local waste_ok = (not okWFP) or (type(wastePct)~="number") or (wastePct <= WASTE_RESET)
-    local dmg_ok   = (not okDmg) or (type(dmg)~="number") or (dmg <= DMG_RESET)
+local reactor = peripheral.wrap(REACTOR_NAME)
+if not reactor then
+  reactor = peripheral.find("fissionReactorLogicAdapter")
+end
+if not reactor then
+  error("reactor not found (type fissionReactorLogicAdapter)")
+end
 
-    if cool_ok and heat_ok and waste_ok and dmg_ok then
-      locked = false
-      locked_reason = "-"
-    end
-  end
+-------------------------
+-- ui (no flicker)
+-------------------------
+local lastLine = {}
 
-  -- ===== auto control =====
-  if auto_on and (not locked) and (not forceDisabled) then
-    if okStatus and (not isOn) then
-      safeCall(function() reactor.activate() end)
-    end
+local function writeLine(y, text, fg, bg)
+  local w, h = mon.getSize()
+  if y < 1 or y > h then return end
 
-    if okMBR and type(maxBurn)=="number" then
-      local minBurn = maxBurn * MIN_BURN_FRAC
-      local cur = (okBR and type(burn)=="number") and burn or last_burn_set or minBurn
-
-      if last_cool == nil and type(coolPct)=="number" then
-        last_cool = coolPct
-      end
-
-      local next = cur
-
-      if type(coolPct) == "number" and last_cool ~= nil then
-        local delta = coolPct - last_cool
-
-        -- 1) coolant rising => increase burn (fast)
-        if delta > EPS_DELTA then
-          next = cur + STEP_UP
-
-        -- 2) coolant stable => increase burn (slow)
-        elseif math.abs(delta) <= EPS_DELTA then
-          next = cur + STEP_UP_SLOW
-
-        -- 3) coolant falling => only decrease if coolant < 40%
-        elseif delta < -EPS_DELTA then
-          if coolPct < COOL_TARGET then
-            -- proportional to decrease amount
-            next = cur - (math.abs(delta) * K_DOWN)
-          else
-            -- above 40%: do not decrease, keep searching equilibrium
-            next = cur
-          end
-        end
-
-        last_cool = coolPct
-      end
-
-      next = clamp(next, minBurn, maxBurn)
-
-      if (last_burn_set == nil) or (math.abs(next - last_burn_set) >= 0.01) then
-        safeCall(function() reactor.setBurnRate(next) end)
-        last_burn_set = next
-      end
-    end
+  text = tostring(text or "")
+  if #text < w then
+    text = text .. string.rep(" ", w - #text)
   else
-    last_burn_set = nil
-    last_cool = nil
+    text = string.sub(text, 1, w)
   end
 
-  -- ===== ui =====
-  drawLine(1, "control fission reactor", colors.cyan, "", colors.white)
-  drawLine(2, REACTOR_NAME, colors.gray,
-    locked and ("lock: " .. locked_reason) or (forceDisabled and "forced") or "ok",
-    (locked or forceDisabled) and colors.red or colors.lime
-  )
+  local key = y .. ":" .. tostring(fg) .. ":" .. tostring(bg)
+  if lastLine[key] == text then return end
+  lastLine[key] = text
 
-  local autoTxt = auto_on and "auto:on" or "auto:off"
-  local autoCol = auto_on and colors.lime or colors.red
-  local stateCol = (stateTxt == "on") and colors.lime or (stateTxt == "off" and colors.red or colors.lightGray)
+  mon.setCursorPos(1, y)
+  if bg then mon.setBackgroundColor(bg) end
+  if fg then mon.setTextColor(fg) end
+  mon.write(text)
+end
 
-  drawLine(4, autoTxt, autoCol, "state: " .. stateTxt, stateCol)
+local function clearAll()
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  lastLine = {}
+end
 
-  local burnTxt = (okBR and okMBR) and (fmtNum(burn,1) .. "/" .. fmtNum(maxBurn,0)) or "n/a"
-  drawLine(5, "cool target: " .. fmtPct(COOL_TARGET), colors.yellow, "burn: " .. burnTxt, colors.green)
+-------------------------
+-- control state
+-------------------------
+local burnCmd = MIN_BURN
+local lastCoolPct = nil
+local locked = false
+local lockReason = "-"
 
-  local y0 = 7
-  drawLine(y0 + 0, "coolant " .. bar(okCFP and coolPct or nil), colors.lightBlue, fmtPct(okCFP and coolPct or nil), colors.lightBlue)
-  drawLine(y0 + 1, "heated  " .. bar(okHFP and heatPct or nil), colors.orange, fmtPct(okHFP and heatPct or nil), colors.orange)
-  drawLine(y0 + 2, "waste   " .. bar(okWFP and wastePct or nil), colors.purple, fmtPct(okWFP and wastePct or nil), colors.purple)
+clearAll()
 
-  local dmgTxt = okDmg and (fmtNum(dmg,1) .. "%") or "n/a"
-  drawLine(H, "damage: " .. dmgTxt .. " | lever " .. AUTO_SIDE, colors.gray, "", colors.white)
+local function setBurn(rate)
+  rate = clamp(rate, 0, MAX_BURN)
+  -- setBurnRate expects 1 argument
+  safeCall(function() reactor.setBurnRate(rate) end)
+end
 
-  sleep(REFRESH_SEC)
+local function scramNow(reason)
+  locked = true
+  lockReason = reason or "lock"
+  setBurn(0)
+  safeCall(function() reactor.scram() end)
+end
+
+local function readAuto()
+  -- if redstone not used, use default
+  local ok = pcall(function() return redstone.getInput(AUTO_SIDE) end)
+  if ok then
+    return redstone.getInput(AUTO_SIDE)
+  end
+  return AUTO_DEFAULT
+end
+
+-------------------------
+-- main loop
+-------------------------
+while true do
+  local w, h = mon.getSize()
+  local barW = clamp(w - 20, 10, 60)
+
+  local auto = readAuto()
+
+  -- reads
+  local okState, state = safeCall(function() return reactor.getStatus() end) -- boolean
+  local okTemp, tempK = safeCall(function() return reactor.getTemperature() end) -- kelvin
+  local okHeatRate, heatRate = safeCall(function() return reactor.getHeatingRate() end) -- mb/t
+  local okDamage, dmgPct = safeCall(function() return reactor.getDamagePercent() end)
+
+  local okCoolPct, coolPct = safeCall(function() return reactor.getCoolantFilledPercentage() end)
+  local okFuelPct, fuelPct = safeCall(function() return reactor.getFuelFilledPercentage() end)
+  local okWastePct, wastePct = safeCall(function() return reactor.getWasteFilledPercentage() end)
+  local okHeatedPct, heatedPct = safeCall(function() return reactor.getHeatedCoolantFilledPercentage() end)
+
+  local okCoolTbl, coolTbl = safeCall(function() return reactor.getCoolant() end)
+  local coolantName = "n/a"
+  if okCoolTbl and type(coolTbl) == "table" and coolTbl.name then
+    coolantName = tostring(coolTbl.name)
+  end
+
+  local okBurn, burnNow = safeCall(function() return reactor.getBurnRate() end)
+  local okMaxBurn, maxBurn = safeCall(function() return reactor.getMaxBurnRate() end)
+
+  -- temp convert
+  local tempC = nil
+  if okTemp and type(tempK) == "number" then
+    tempC = tempK - 273.15
+  end
+
+  -- safety checks
+  if not locked then
+    if okDamage and type(dmgPct) == "number" and dmgPct >= DAMAGE_LOCK then
+      scramNow("damage lock")
+    elseif type(tempC) == "number" and tempC >= TEMP_LOCK_C then
+      scramNow("temp lock")
+    elseif okHeatedPct and type(heatedPct) == "number" and heatedPct >= HEATED_LOCK then
+      scramNow("heated lock")
+    elseif okWastePct and type(wastePct) == "number" and wastePct >= WASTE_LOCK then
+      scramNow("waste lock")
+    end
+  end
+
+  -- auto regulation (coolant target)
+  if auto and (not locked) and okCoolPct and type(coolPct) == "number" then
+    local dCool = 0
+    if type(lastCoolPct) == "number" then
+      dCool = coolPct - lastCoolPct
+    end
+    lastCoolPct = coolPct
+
+    local stable = math.abs(dCool) <= STABLE_EPS
+
+    local delta = 0
+
+    if coolPct < COOL_LOW then
+      -- strong decrease when below 40%
+      local severity = (COOL_LOW - coolPct) / COOL_LOW
+      delta = -RAMP_DOWN * (0.5 + severity)
+    elseif coolPct < COOL_TARGET then
+      -- decrease proportional between 40% and 45%
+      local severity = (COOL_TARGET - coolPct) / (COOL_TARGET - COOL_LOW)
+      delta = -RAMP_DOWN * 0.5 * severity
+    else
+      -- above target: increase
+      local gain = 1.0
+      if coolPct > COOL_HIGH then
+        gain = 0.5
+      end
+
+      if stable then
+        delta = (RAMP_UP * 0.4 * gain) + STABLE_BONUS
+      else
+        -- if coolant rising, we can push more; if falling, push less
+        if dCool > 0 then
+          delta = RAMP_UP * 1.0 * gain
+        else
+          delta = RAMP_UP * 0.3 * gain
+        end
+      end
+    end
+
+    burnCmd = clamp(burnCmd + delta, MIN_BURN, MAX_BURN)
+    setBurn(burnCmd)
+  else
+    -- keep last coolant for stability calc
+    if okCoolPct and type(coolPct) == "number" then
+      lastCoolPct = coolPct
+    end
+  end
+
+  -- ui
+  local title = "control fission reactor"
+  local rname = "fissionReactorLogicAdapter_0"
+  writeLine(1, title, colors.cyan, colors.black)
+  writeLine(2, rname, colors.lightGray, colors.black)
+
+  local stateTxt = "n/a"
+  if okState then
+    if state then stateTxt = "on" else stateTxt = "off" end
+  end
+
+  local tempTxt = "n/a"
+  if type(tempC) == "number" then
+    tempTxt = fmtNum(tempC, 1) .. " c"
+  end
+
+  local heatTxt = "n/a"
+  if okHeatRate and type(heatRate) == "number" then
+    heatTxt = fmtNum(heatRate, 2) .. " mb/t"
+  end
+
+  local lockTxt = "-"
+  if locked then lockTxt = lockReason end
+
+  local burnTxt = "n/a"
+  if okBurn and type(burnNow) == "number" then
+    burnTxt = fmtNum(burnNow, 2)
+  else
+    burnTxt = fmtNum(burnCmd, 2)
+  end
+
+  local maxBurnTxt = "n/a"
+  if okMaxBurn and type(maxBurn) == "number" then
+    maxBurnTxt = fmtNum(maxBurn, 2)
+  else
+    maxBurnTxt = fmtNum(MAX_BURN, 2)
+  end
+
+  -- line 3-5 summary
+  writeLine(3, "state: " .. stateTxt, colors.white, colors.black)
+  writeLine(4, "temp:  " .. tempTxt, colors.orange, colors.black)
+  writeLine(5, "heat:  " .. heatTxt .. "   cool: " .. coolantName, colors.white, colors.black)
+
+  -- auto / lock / burn
+  local autoTxt = auto and "auto:on " or "auto:off"
+  local lockShow = locked and ("lock: " .. lockTxt) or "lock: -"
+  writeLine(6, autoTxt .. "   " .. lockShow .. "   burn: " .. burnTxt .. "/" .. maxBurnTxt, colors.white, colors.black)
+
+  -- bars
+  local coolBar = bar(okCoolPct and coolPct or nil, barW)
+  local fuelBar = bar(okFuelPct and fuelPct or nil, barW)
+  local wasteBar = bar(okWastePct and wastePct or nil, barW)
+  local heatBar = bar(okHeatedPct and heatedPct or nil, barW)
+
+  local function pctTxt(ok, v)
+    if ok and type(v) == "number" then
+      return fmtNum(v * 100, 1) .. "%"
+    end
+    return "n/a"
+  end
+
+  writeLine(8,  "coolant " .. coolBar .. " " .. pctTxt(okCoolPct, coolPct), colors.lightBlue, colors.black)
+  writeLine(9,  "fuel    " .. fuelBar .. " " .. pctTxt(okFuelPct, fuelPct), colors.lime, colors.black)
+  writeLine(10, "waste   " .. wasteBar .. " " .. pctTxt(okWastePct, wastePct), colors.purple, colors.black)
+  writeLine(11, "heated  " .. heatBar .. " " .. pctTxt(okHeatedPct, heatedPct), colors.yellow, colors.black)
+
+  -- numeric values with units
+  local okCoolCap, coolCap = safeCall(function() return reactor.getCoolantCapacity() end)
+  local okFuelCap, fuelCap = safeCall(function() return reactor.getFuelCapacity() end)
+  local okWasteCap, wasteCap = safeCall(function() return reactor.getWasteCapacity() end)
+  local okHeatCap, heatCap = safeCall(function() return reactor.getHeatedCoolantCapacity() end)
+
+  local coolAmt = (okCoolPct and okCoolCap and type(coolPct)=="number" and type(coolCap)=="number") and (coolPct * coolCap) or nil
+  local fuelAmt = (okFuelPct and okFuelCap and type(fuelPct)=="number" and type(fuelCap)=="number") and (fuelPct * fuelCap) or nil
+  local wasteAmt = (okWastePct and okWasteCap and type(wastePct)=="number" and type(wasteCap)=="number") and (wastePct * wasteCap) or nil
+  local heatAmt = (okHeatedPct and okHeatCap and type(heatedPct)=="number" and type(heatCap)=="number") and (heatedPct * heatCap) or nil
+
+  local dmgTxt = "n/a"
+  if okDamage and type(dmgPct)=="number" then
+    dmgTxt = fmtNum(dmgPct, 1) .. "%"
+  end
+
+  writeLine(13, "coolant: " .. (coolAmt and (fmtNum(coolAmt,0) .. "/" .. fmtNum(coolCap,0) .. " mb") or "n/a"), colors.lightBlue, colors.black)
+  writeLine(14, "fuel:    " .. (fuelAmt and (fmtNum(fuelAmt,0) .. "/" .. fmtNum(fuelCap,0) .. " mb") or "n/a"), colors.lime, colors.black)
+  writeLine(15, "waste:   " .. (wasteAmt and (fmtNum(wasteAmt,0) .. "/" .. fmtNum(wasteCap,0) .. " mb") or "n/a"), colors.purple, colors.black)
+  writeLine(16, "heated:  " .. (heatAmt and (fmtNum(heatAmt,0) .. "/" .. fmtNum(heatCap,0) .. " mb") or "n/a"), colors.yellow, colors.black)
+
+  writeLine(18, "damage: " .. dmgTxt .. " | cool target: " .. fmtNum(COOL_TARGET*100,0) .. "%", colors.white, colors.black)
+
+  sleep(LOOP_SEC)
 end
