@@ -1,0 +1,138 @@
+-- ===============================
+-- reactor_code_v0_3
+-- cc:tweaked + mekanism
+-- base saine v0.1 + affichage 7x6
+-- ===============================
+
+-- peripherals
+local monitor = peripheral.find("monitor")
+local reactor = peripheral.find("fissionReactorLogicAdapter")
+
+if not monitor then error("no monitor found") end
+if not reactor then error("no fissionreactorlogicadapter found") end
+
+monitor.setTextScale(0.5)
+monitor.setBackgroundColor(colors.black)
+monitor.clear()
+
+-- ===============================
+-- helpers
+-- ===============================
+
+local function pct(data)
+  if type(data) ~= "table" or not data.amount or not data.capacity or data.capacity == 0 then
+    return "n/a"
+  end
+  return string.format("%.1f%%", (data.amount / data.capacity) * 100)
+end
+
+local function bar(y, label, data)
+  local w = 28
+  monitor.setCursorPos(2, y)
+  monitor.write(label)
+
+  monitor.setCursorPos(12, y)
+  monitor.write("[")
+
+  local fill = 0
+  if type(data) == "table" and data.amount and data.capacity and data.capacity > 0 then
+    fill = math.floor((data.amount / data.capacity) * w)
+  end
+
+  for i = 1, w do
+    if i <= fill then
+      monitor.write("=")
+    else
+      monitor.write("-")
+    end
+  end
+  monitor.write("]")
+end
+
+local function temp_c()
+  local t = reactor.getTemperature()
+  if not t then return "n/a" end
+  return string.format("%.1f c", t - 273.15)
+end
+
+-- ===============================
+-- main loop
+-- ===============================
+
+while true do
+  monitor.clear()
+
+  -- header
+  monitor.setCursorPos(2,1)
+  monitor.setTextColor(colors.cyan)
+  monitor.write("control fission reactor")
+
+  monitor.setCursorPos(2,2)
+  monitor.setTextColor(colors.gray)
+  monitor.write("fissionreactorlogicadapter_0")
+
+  -- state
+  monitor.setCursorPos(2,4)
+  monitor.setTextColor(colors.green)
+  monitor.write("auto: off")
+
+  monitor.setCursorPos(2,5)
+  monitor.setTextColor(colors.white)
+  monitor.write("state: ")
+  if reactor.getStatus() then
+    monitor.setTextColor(colors.green)
+    monitor.write("on")
+  else
+    monitor.setTextColor(colors.red)
+    monitor.write("off")
+  end
+
+  monitor.setCursorPos(2,6)
+  monitor.setTextColor(colors.yellow)
+  monitor.write("cause: -")
+
+  -- temperature
+  monitor.setCursorPos(16,6)
+  monitor.setTextColor(colors.white)
+  monitor.write("temp: "..temp_c())
+
+  -- bars
+  bar(8,  "coolant", reactor.getCoolant())
+  bar(9,  "fuel   ", reactor.getFuel())
+  bar(10, "waste  ", reactor.getWaste())
+  bar(11, "heated ", reactor.getHeatedCoolant())
+
+  -- values
+  monitor.setCursorPos(2,13)
+  monitor.setTextColor(colors.lightBlue)
+  monitor.write("coolant "..pct(reactor.getCoolant()))
+
+  monitor.setCursorPos(2,14)
+  monitor.setTextColor(colors.green)
+  monitor.write("fuel    "..pct(reactor.getFuel()))
+
+  monitor.setCursorPos(2,15)
+  monitor.setTextColor(colors.purple)
+  monitor.write("waste   "..pct(reactor.getWaste()))
+
+  monitor.setCursorPos(2,16)
+  monitor.setTextColor(colors.orange)
+  monitor.write("heated  "..pct(reactor.getHeatedCoolant()))
+
+  monitor.setCursorPos(2,17)
+  monitor.setTextColor(colors.red)
+  monitor.write("damage  "..string.format("%.1f%%", reactor.getDamagePercent() or 0))
+
+  -- burn rate
+  monitor.setCursorPos(2,19)
+  monitor.setTextColor(colors.white)
+  monitor.write(
+    string.format(
+      "burn: %.2f / %.2f",
+      reactor.getActualBurnRate() or 0,
+      reactor.getMaxBurnRate() or 0
+    )
+  )
+
+  sleep(0.5)
+end
