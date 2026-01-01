@@ -1,6 +1,7 @@
--- controle reacteur fission v0.6
--- cc:tweaked + mekanism fission reactor logic adapter
--- important: garder les majuscules des methodes (getTemperature, getCoolantFilledPercentage, etc)
+-- controle reacteur fission v0.6.1
+-- monitor: monitor_9
+-- reactor: fissionReactorLogicAdapter_1
+-- auto lever: redstone input on FRONT
 
 -------------------------
 -- config
@@ -11,7 +12,7 @@ local REACTOR_NAME = "fissionReactorLogicAdapter_1"
 local TEXT_SCALE = 1.8
 local LOOP_SEC = 0.5
 
-local AUTO_SIDE = "left"
+local AUTO_SIDE = "front" -- changed from left to front
 local AUTO_DEFAULT = true
 
 local COOL_TARGET = 0.45
@@ -81,37 +82,36 @@ local reactorDisplayName = peripheral.getName(reactor) or REACTOR_NAME
 -------------------------
 -- ui sans clignotement
 -------------------------
-local lastLine = {}
+local lastCell = {}
 
-local function writeLine(y, text, fg, bg)
+local function cellKey(x, y, fg, bg)
+  return tostring(x) .. "," .. tostring(y) .. ":" .. tostring(fg) .. ":" .. tostring(bg)
+end
+
+local function writeAt(x, y, text, fg, bg)
   local w, h = mon.getSize()
   if y < 1 or y > h then return end
-
+  if x < 1 then x = 1 end
   text = tostring(text or "")
-  if #text < w then
-    text = text .. string.rep(" ", w - #text)
-  else
-    text = string.sub(text, 1, w)
-  end
-
-  local key = y .. ":" .. tostring(fg) .. ":" .. tostring(bg)
-  if lastLine[key] == text then return end
-  lastLine[key] = text
-
-  mon.setCursorPos(1, y)
   if bg then mon.setBackgroundColor(bg) end
   if fg then mon.setTextColor(fg) end
+
+  local k = cellKey(x, y, fg, bg)
+  if lastCell[k] == text then return end
+  lastCell[k] = text
+
+  mon.setCursorPos(x, y)
   mon.write(text)
 end
 
 local function clearAll()
   mon.setBackgroundColor(colors.black)
   mon.clear()
-  lastLine = {}
+  lastCell = {}
 end
 
 -------------------------
--- controle
+-- control
 -------------------------
 local burnCmd = MIN_BURN
 local lastCoolPct = nil
@@ -138,12 +138,29 @@ local function readAuto()
   return AUTO_DEFAULT
 end
 
+local function pctTxt(v)
+  if type(v) == "number" then return fmtNum(v * 100, 1) .. "%" end
+  return "n/a"
+end
+
+local function statusColor(isOn)
+  if isOn == true then return colors.lime end
+  if isOn == false then return colors.red end
+  return colors.lightGray
+end
+
+local function yesNoColor(v)
+  if v == true then return colors.lime end
+  if v == false then return colors.red end
+  return colors.lightGray
+end
+
 -------------------------
--- boucle principale
+-- main loop
 -------------------------
 while true do
   local w, h = mon.getSize()
-  local barW = clamp(w - 22, 10, 60)
+  local barW = clamp(w - 20, 10, 60)
 
   local auto = readAuto()
 
@@ -171,20 +188,20 @@ while true do
     tempC = tempK - 273.15
   end
 
-  -- securites
+  -- safety locks
   if not locked then
     if okDamage and type(dmgPct) == "number" and dmgPct >= DAMAGE_LOCK then
       scramNow("degats")
     elseif type(tempC) == "number" and tempC >= TEMP_LOCK_C then
       scramNow("temperature")
     elseif okHeatedPct and type(heatedPct) == "number" and heatedPct >= HEATED_LOCK then
-      scramNow("liquide chauffe")
+      scramNow("chauffe")
     elseif okWastePct and type(wastePct) == "number" and wastePct >= WASTE_LOCK then
       scramNow("dechets")
     end
   end
 
-  -- regulation burn selon coolant
+  -- regulation burn (coolant based)
   if auto and (not locked) and okCoolPct and type(coolPct) == "number" then
     local dCool = 0
     if type(lastCoolPct) == "number" then
@@ -204,7 +221,6 @@ while true do
     else
       local gain = 1.0
       if coolPct > COOL_HIGH then gain = 0.6 end
-
       if stable then
         delta = (RAMP_UP * 0.4 * gain) + STABLE_BONUS
       else
@@ -222,43 +238,7 @@ while true do
     if okCoolPct and type(coolPct) == "number" then lastCoolPct = coolPct end
   end
 
-  -- affichage
-  writeLine(1, "controle reacteur fission", colors.cyan, colors.black)
-  writeLine(2, reactorDisplayName, colors.lightGray, colors.black)
-
-  local etatTxt = "n/a"
-  if okState then etatTxt = state and "marche" or "arret" end
-
-  local tempTxt = "n/a"
-  if type(tempC) == "number" then tempTxt = fmtNum(tempC, 1) .. " c" end
-
-  local heatTxt = "n/a"
-  if okHeatRate and type(heatRate) == "number" then
-    heatTxt = fmtNum(heatRate, 2) .. " mb/t"
-  end
-
-  local verrouTxt = locked and ("oui (" .. lockReason .. ")") or "non"
-  local autoTxt = auto and "auto: oui" or "auto: non"
-
-  local burnTxt = okBurn and type(burnNow) == "number" and fmtNum(burnNow, 2) or fmtNum(burnCmd, 2)
-  local maxBurnTxt = okMaxBurn and type(maxBurn) == "number" and fmtNum(maxBurn, 2) or fmtNum(MAX_BURN, 2)
-
-  writeLine(3, "etat: " .. etatTxt .. "   " .. autoTxt, colors.white, colors.black)
-  writeLine(4, "temp: " .. tempTxt .. "   chauffe: " .. heatTxt, colors.white, colors.black)
-  writeLine(5, "coolant: " .. coolantName .. "   burn: " .. burnTxt .. "/" .. maxBurnTxt, colors.white, colors.black)
-  writeLine(6, "verrouillage: " .. verrouTxt .. "   cible coolant: " .. fmtNum(COOL_TARGET*100,0) .. "%", colors.white, colors.black)
-
-  local function pctTxt(ok, v)
-    if ok and type(v) == "number" then return fmtNum(v * 100, 1) .. "%" end
-    return "n/a"
-  end
-
-  writeLine(8,  "coolant " .. bar(okCoolPct and coolPct or nil, barW) .. " " .. pctTxt(okCoolPct, coolPct), colors.lightBlue, colors.black)
-  writeLine(9,  "fuel    " .. bar(okFuelPct and fuelPct or nil, barW) .. " " .. pctTxt(okFuelPct, fuelPct), colors.lime, colors.black)
-  writeLine(10, "dechets " .. bar(okWastePct and wastePct or nil, barW) .. " " .. pctTxt(okWastePct, wastePct), colors.purple, colors.black)
-  writeLine(11, "chauffe " .. bar(okHeatedPct and heatedPct or nil, barW) .. " " .. pctTxt(okHeatedPct, heatedPct), colors.yellow, colors.black)
-
-  -- valeurs numeriques
+  -- numeric capacities (fix coolant n/a)
   local okCoolCap, coolCap = safeCall(function() return reactor.getCoolantCapacity() end)
   local okFuelCap, fuelCap = safeCall(function() return reactor.getFuelCapacity() end)
   local okWasteCap, wasteCap = safeCall(function() return reactor.getWasteCapacity() end)
@@ -269,15 +249,78 @@ while true do
   local wasteAmt = (okWastePct and okWasteCap and type(wastePct)=="number" and type(wasteCap)=="number") and (wastePct * wasteCap) or nil
   local heatAmt = (okHeatedPct and okHeatCap and type(heatedPct)=="number" and type(heatCap)=="number") and (heatedPct * heatCap) or nil
 
-  local degatsTxt = "n/a"
-  if okDamage and type(dmgPct)=="number" then degatsTxt = fmtNum(dmgPct, 1) .. "%" end
+  -- display (uppercase labels + colors)
+  -- line 1 title
+  writeAt(1, 1, "controle reacteur fission", colors.cyan, colors.black)
+  writeAt(1, 2, reactorDisplayName, colors.lightGray, colors.black)
 
-  writeLine(13, "coolant: " .. (coolAmt and (fmtNum(coolAmt,0) .. "/" .. fmtNum(coolCap,0) .. " mb") or "n/a"), colors.lightBlue, colors.black)
-  writeLine(14, "fuel:    " .. (fuelAmt and (fmtNum(fuelAmt,0) .. "/" .. fmtNum(fuelCap,0) .. " mb") or "n/a"), colors.lime, colors.black)
-  writeLine(15, "dechets: " .. (wasteAmt and (fmtNum(wasteAmt,0) .. "/" .. fmtNum(wasteCap,0) .. " mb") or "n/a"), colors.purple, colors.black)
-  writeLine(16, "chauffe: " .. (heatAmt and (fmtNum(heatAmt,0) .. "/" .. fmtNum(heatCap,0) .. " mb") or "n/a"), colors.yellow, colors.black)
+  -- line 3: etat + auto
+  writeAt(1, 3, "etat:", colors.white, colors.black)
+  local etatTxt = "n/a"
+  if okState then etatTxt = state and "marche" or "arret" end
+  writeAt(7, 3, string.upper(etatTxt), statusColor(okState and state or nil), colors.black)
 
-  writeLine(18, "degats: " .. degatsTxt .. " | limite burn: " .. fmtNum(MAX_BURN,0) .. " mb", colors.white, colors.black)
+  writeAt(17, 3, "auto:", colors.white, colors.black)
+  writeAt(23, 3, auto and "OUI" or "NON", yesNoColor(auto), colors.black)
+
+  -- line 4: temp + chauffe
+  writeAt(1, 4, "temp:", colors.white, colors.black)
+  local tempTxt = (type(tempC)=="number") and (fmtNum(tempC,1) .. " C") or "n/a"
+  writeAt(7, 4, tempTxt, colors.orange, colors.black)
+
+  writeAt(17, 4, "chauffe:", colors.white, colors.black)
+  local heatTxt = (okHeatRate and type(heatRate)=="number") and (fmtNum(heatRate,2) .. " MB/T") or "n/a"
+  writeAt(26, 4, heatTxt, colors.orange, colors.black)
+
+  -- line 5: coolant type + burn
+  writeAt(1, 5, "coolant:", colors.white, colors.black)
+  writeAt(10, 5, coolantName, colors.lightBlue, colors.black)
+
+  writeAt(30, 5, "burn:", colors.white, colors.black)
+  local burnTxt = okBurn and type(burnNow)=="number" and fmtNum(burnNow,2) or fmtNum(burnCmd,2)
+  local maxBurnTxt = okMaxBurn and type(maxBurn)=="number" and fmtNum(maxBurn,0) or fmtNum(MAX_BURN,0)
+  writeAt(36, 5, burnTxt .. "/" .. maxBurnTxt, colors.yellow, colors.black)
+
+  -- line 6: lock + target
+  writeAt(1, 6, "verrouillage:", colors.white, colors.black)
+  writeAt(15, 6, locked and "OUI" or "NON", locked and colors.red or colors.lime, colors.black)
+  if locked then
+    writeAt(20, 6, "(" .. lockReason .. ")", colors.red, colors.black)
+  end
+  writeAt(34, 6, "cible coolant:", colors.white, colors.black)
+  writeAt(48, 6, fmtNum(COOL_TARGET*100,0) .. "%", colors.lightBlue, colors.black)
+
+  -- bars
+  writeAt(1, 8,  "COOLANT " .. bar(okCoolPct and coolPct or nil, barW), colors.lightBlue, colors.black)
+  writeAt(10 + barW, 8, " " .. pctTxt(okCoolPct and coolPct or nil), colors.lightBlue, colors.black)
+
+  writeAt(1, 9,  "FUEL    " .. bar(okFuelPct and fuelPct or nil, barW), colors.lime, colors.black)
+  writeAt(10 + barW, 9, " " .. pctTxt(okFuelPct and fuelPct or nil), colors.lime, colors.black)
+
+  writeAt(1, 10, "DECHETS " .. bar(okWastePct and wastePct or nil, barW), colors.purple, colors.black)
+  writeAt(10 + barW, 10, " " .. pctTxt(okWastePct and wastePct or nil), colors.purple, colors.black)
+
+  writeAt(1, 11, "CHAUFFE " .. bar(okHeatedPct and heatedPct or nil, barW), colors.yellow, colors.black)
+  writeAt(10 + barW, 11, " " .. pctTxt(okHeatedPct and heatedPct or nil), colors.yellow, colors.black)
+
+  -- numeric amounts with units (mb)
+  local function amtLine(label, amt, cap, color, y)
+    writeAt(1, y, label, color, colors.black)
+    if type(amt)=="number" and type(cap)=="number" then
+      writeAt(10, y, fmtNum(amt,0) .. "/" .. fmtNum(cap,0) .. " MB", color, colors.black)
+    else
+      writeAt(10, y, "n/a", colors.lightGray, colors.black)
+    end
+  end
+
+  amtLine("coolant:", coolAmt, (okCoolCap and coolCap or nil), colors.lightBlue, 13)
+  amtLine("fuel:",    fuelAmt, (okFuelCap and fuelCap or nil), colors.lime, 14)
+  amtLine("dechets:", wasteAmt,(okWasteCap and wasteCap or nil), colors.purple, 15)
+  amtLine("chauffe:", heatAmt, (okHeatCap and heatCap or nil), colors.yellow, 16)
+
+  -- bottom line: damage
+  local dmgTxt = (okDamage and type(dmgPct)=="number") and (fmtNum(dmgPct,1) .. "%") or "n/a"
+  writeAt(1, 18, "degats: " .. dmgTxt .. " | limite burn: " .. fmtNum(MAX_BURN,0) .. " MB", colors.white, colors.black)
 
   sleep(LOOP_SEC)
 end
