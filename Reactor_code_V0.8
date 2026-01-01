@@ -1,7 +1,11 @@
--- controle reacteur fission v0.6.1
+-- controle reacteur fission v0.6.2
 -- monitor: monitor_9
 -- reactor: fissionReactorLogicAdapter_1
 -- auto lever: redstone input on FRONT
+-- changes:
+-- 1) auto off => reactor off (scram + burn 0)
+-- 2) auto on + cleared lock + passed relight threshold => reactor on (activate)
+-- 3) coolant regulation: min=30% target=33%
 
 -------------------------
 -- config
@@ -12,11 +16,11 @@ local REACTOR_NAME = "fissionReactorLogicAdapter_1"
 local TEXT_SCALE = 1.8
 local LOOP_SEC = 0.5
 
-local AUTO_SIDE = "front" -- changed from left to front
+local AUTO_SIDE = "front"
 local AUTO_DEFAULT = true
 
-local COOL_TARGET = 0.45
-local COOL_LOW = 0.40
+local COOL_TARGET = 0.33
+local COOL_LOW = 0.30
 local COOL_HIGH = 0.80
 
 local MIN_BURN = 0.20
@@ -31,6 +35,12 @@ local DAMAGE_LOCK = 30.0
 local TEMP_LOCK_C = 1200.0
 local HEATED_LOCK = 0.95
 local WASTE_LOCK = 0.95
+
+-- relight thresholds (must be met to auto-activate after a lock)
+local RELIGHT_DAMAGE = 25.0
+local RELIGHT_TEMP_C = 800.0
+local RELIGHT_HEATED = 0.80
+local RELIGHT_WASTE = 0.80
 
 -------------------------
 -- helpers
@@ -118,18 +128,24 @@ local lastCoolPct = nil
 local locked = false
 local lockReason = "-"
 
-clearAll()
-
 local function setBurn(rate)
   rate = clamp(rate, 0, MAX_BURN)
   safeCall(function() reactor.setBurnRate(rate) end)
 end
 
+local function reactorOff()
+  setBurn(0)
+  safeCall(function() reactor.scram() end)
+end
+
+local function reactorOn()
+  safeCall(function() reactor.activate() end)
+end
+
 local function scramNow(reason)
   locked = true
   lockReason = reason or "verrouillage"
-  setBurn(0)
-  safeCall(function() reactor.scram() end)
+  reactorOff()
 end
 
 local function readAuto()
@@ -154,6 +170,16 @@ local function yesNoColor(v)
   if v == false then return colors.red end
   return colors.lightGray
 end
+
+local function relightOk(tempC, dmgPct, heatedPct, wastePct)
+  if type(dmgPct) ~= "number" or dmgPct > RELIGHT_DAMAGE then return false end
+  if type(tempC) ~= "number" or tempC > RELIGHT_TEMP_C then return false end
+  if type(heatedPct) ~= "number" or heatedPct > RELIGHT_HEATED then return false end
+  if type(wastePct) ~= "number" or wastePct > RELIGHT_WASTE then return false end
+  return true
+end
+
+clearAll()
 
 -------------------------
 -- main loop
@@ -188,8 +214,17 @@ while true do
     tempC = tempK - 273.15
   end
 
-  -- safety locks
-  if not locked then
+  -- auto off => force reactor off (and reset ramp memory)
+  if not auto then
+    locked = false
+    lockReason = "-"
+    burnCmd = MIN_BURN
+    lastCoolPct = nil
+    reactorOff()
+  end
+
+  -- safety locks (only when auto is on)
+  if auto and (not locked) then
     if okDamage and type(dmgPct) == "number" and dmgPct >= DAMAGE_LOCK then
       scramNow("degats")
     elseif type(tempC) == "number" and tempC >= TEMP_LOCK_C then
@@ -201,7 +236,26 @@ while true do
     end
   end
 
-  -- regulation burn (coolant based)
+  -- relight: if locked and now safe again, clear lock and start reactor
+  if auto and locked then
+    local ok = relightOk(tempC, dmgPct, heatedPct, wastePct)
+    if ok then
+      locked = false
+      lockReason = "-"
+      burnCmd = MIN_BURN
+      setBurn(burnCmd)
+      reactorOn()
+    else
+      reactorOff()
+    end
+  end
+
+  -- ensure reactor on when auto on and not locked
+  if auto and (not locked) and okState and state == false then
+    reactorOn()
+  end
+
+  -- regulation burn (coolant based) only when auto on and not locked
   if auto and (not locked) and okCoolPct and type(coolPct) == "number" then
     local dCool = 0
     if type(lastCoolPct) == "number" then
@@ -234,11 +288,9 @@ while true do
 
     burnCmd = clamp(burnCmd + delta, MIN_BURN, MAX_BURN)
     setBurn(burnCmd)
-  else
-    if okCoolPct and type(coolPct) == "number" then lastCoolPct = coolPct end
   end
 
-  -- numeric capacities (fix coolant n/a)
+  -- numeric capacities
   local okCoolCap, coolCap = safeCall(function() return reactor.getCoolantCapacity() end)
   local okFuelCap, fuelCap = safeCall(function() return reactor.getFuelCapacity() end)
   local okWasteCap, wasteCap = safeCall(function() return reactor.getWasteCapacity() end)
@@ -249,12 +301,10 @@ while true do
   local wasteAmt = (okWastePct and okWasteCap and type(wastePct)=="number" and type(wasteCap)=="number") and (wastePct * wasteCap) or nil
   local heatAmt = (okHeatedPct and okHeatCap and type(heatedPct)=="number" and type(heatCap)=="number") and (heatedPct * heatCap) or nil
 
-  -- display (uppercase labels + colors)
-  -- line 1 title
+  -- display
   writeAt(1, 1, "controle reacteur fission", colors.cyan, colors.black)
   writeAt(1, 2, reactorDisplayName, colors.lightGray, colors.black)
 
-  -- line 3: etat + auto
   writeAt(1, 3, "etat:", colors.white, colors.black)
   local etatTxt = "n/a"
   if okState then etatTxt = state and "marche" or "arret" end
@@ -263,7 +313,6 @@ while true do
   writeAt(17, 3, "auto:", colors.white, colors.black)
   writeAt(23, 3, auto and "OUI" or "NON", yesNoColor(auto), colors.black)
 
-  -- line 4: temp + chauffe
   writeAt(1, 4, "temp:", colors.white, colors.black)
   local tempTxt = (type(tempC)=="number") and (fmtNum(tempC,1) .. " C") or "n/a"
   writeAt(7, 4, tempTxt, colors.orange, colors.black)
@@ -272,7 +321,6 @@ while true do
   local heatTxt = (okHeatRate and type(heatRate)=="number") and (fmtNum(heatRate,2) .. " MB/T") or "n/a"
   writeAt(26, 4, heatTxt, colors.orange, colors.black)
 
-  -- line 5: coolant type + burn
   writeAt(1, 5, "coolant:", colors.white, colors.black)
   writeAt(10, 5, coolantName, colors.lightBlue, colors.black)
 
@@ -281,7 +329,6 @@ while true do
   local maxBurnTxt = okMaxBurn and type(maxBurn)=="number" and fmtNum(maxBurn,0) or fmtNum(MAX_BURN,0)
   writeAt(36, 5, burnTxt .. "/" .. maxBurnTxt, colors.yellow, colors.black)
 
-  -- line 6: lock + target
   writeAt(1, 6, "verrouillage:", colors.white, colors.black)
   writeAt(15, 6, locked and "OUI" or "NON", locked and colors.red or colors.lime, colors.black)
   if locked then
@@ -290,7 +337,6 @@ while true do
   writeAt(34, 6, "cible coolant:", colors.white, colors.black)
   writeAt(48, 6, fmtNum(COOL_TARGET*100,0) .. "%", colors.lightBlue, colors.black)
 
-  -- bars
   writeAt(1, 8,  "COOLANT " .. bar(okCoolPct and coolPct or nil, barW), colors.lightBlue, colors.black)
   writeAt(10 + barW, 8, " " .. pctTxt(okCoolPct and coolPct or nil), colors.lightBlue, colors.black)
 
@@ -303,7 +349,6 @@ while true do
   writeAt(1, 11, "CHAUFFE " .. bar(okHeatedPct and heatedPct or nil, barW), colors.yellow, colors.black)
   writeAt(10 + barW, 11, " " .. pctTxt(okHeatedPct and heatedPct or nil), colors.yellow, colors.black)
 
-  -- numeric amounts with units (mb)
   local function amtLine(label, amt, cap, color, y)
     writeAt(1, y, label, color, colors.black)
     if type(amt)=="number" and type(cap)=="number" then
@@ -318,9 +363,9 @@ while true do
   amtLine("dechets:", wasteAmt,(okWasteCap and wasteCap or nil), colors.purple, 15)
   amtLine("chauffe:", heatAmt, (okHeatCap and heatCap or nil), colors.yellow, 16)
 
-  -- bottom line: damage
   local dmgTxt = (okDamage and type(dmgPct)=="number") and (fmtNum(dmgPct,1) .. "%") or "n/a"
   writeAt(1, 18, "degats: " .. dmgTxt .. " | limite burn: " .. fmtNum(MAX_BURN,0) .. " MB", colors.white, colors.black)
 
   sleep(LOOP_SEC)
 end
+```0
